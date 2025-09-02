@@ -30,7 +30,7 @@ impl Default for AppConfig {
             proxy_password: None,
             user_agent: Some("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36".to_string()),
             log_to_file: Some(true),
-            log_file_path: None,
+            log_file_path: Some("logs".to_string()),
         }
     }
 }
@@ -145,24 +145,25 @@ impl AppConfig {
         self.log_to_file.unwrap_or(true)
     }
 
-    pub fn get_log_file_path(&self) -> Option<String> {
-        self.log_file_path.clone()
+    pub fn get_log_file_path(&self) -> String {
+        self.log_file_path.as_deref().unwrap_or("logs").to_string()
     }
 
     /// 生成默认的日志文件路径
-    pub fn generate_default_log_path() -> PathBuf {
+    pub fn generate_log_path(&self) -> PathBuf {
         let timestamp = chrono::Local::now().format("%Y-%m-%d-%H-%M-%S");
         let filename = format!("screc-{}.log", timestamp);
+        let log_dir = self.get_log_file_path();
 
         // 尝试获取程序所在目录
         if let Ok(exe_path) = std::env::current_exe() {
             if let Some(exe_dir) = exe_path.parent() {
-                return exe_dir.join("logs").join(filename);
+                return exe_dir.join(&log_dir).join(filename);
             }
         }
 
         // 如果获取失败，使用当前工作目录的logs文件夹
-        PathBuf::from("logs").join(filename)
+        PathBuf::from(&log_dir).join(filename)
     }
 
     #[allow(dead_code)]

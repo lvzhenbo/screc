@@ -61,9 +61,9 @@ struct Cli {
     #[arg(long)]
     log_file: Option<String>,
 
-    /// 生成默认配置文件
-    #[arg(long)]
-    generate_config: bool,
+    /// 生成默认配置文件，可选择指定配置文件名（默认为 config.json）
+    #[arg(long, num_args = 0..=1, default_missing_value = "config.json")]
+    generate_config: Option<String>,
 }
 
 impl From<&Cli> for CliArgs {
@@ -89,17 +89,48 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // 如果需要生成配置文件
-    if cli.generate_config {
-        let config_path = cli
-            .config
-            .as_deref()
-            .map(PathBuf::from)
-            .unwrap_or_else(AppConfig::get_default_config_path);
+    if let Some(config_filename) = &cli.generate_config {
+        // 检查是否与其他功能参数冲突
+        if cli.usernames.is_some()
+            || cli.output_dir.is_some()
+            || cli.resolution.is_some()
+            || cli.check_interval.is_some()
+            || cli.proxy.is_some()
+        {
+            eprintln!(
+                "{}",
+                "错误: 生成配置文件功能不能与其他录制相关参数一起使用".red()
+            );
+            eprintln!("{}", "请单独使用 --generate-config 参数".yellow());
+            std::process::exit(1);
+        }
 
-        AppConfig::default()
-            .save_to_file(&config_path)
-            .inspect(|_| info!("默认配置文件已生成: {}", config_path.display()))
-            .inspect_err(|e| error!("生成配置文件失败: {}", e))?;
+        let config_path = PathBuf::from(config_filename);
+
+        // 检查文件是否已存在
+        if config_path.exists() {
+            println!(
+                "{}",
+                format!("警告: 配置文件 {} 已存在，将被覆盖", config_path.display()).yellow()
+            );
+        }
+
+        match AppConfig::default().save_to_file(&config_path) {
+            Ok(_) => {
+                println!(
+                    "{}",
+                    format!("✓ 默认配置文件已生成: {}", config_path.display()).green()
+                );
+                println!(
+                    "{}",
+                    "配置文件生成完成，您可以编辑该文件来自定义录制设置".cyan()
+                );
+            }
+            Err(e) => {
+                eprintln!("{}", format!("错误: 生成配置文件失败: {}", e).red());
+                std::process::exit(1);
+            }
+        }
 
         return Ok(());
     }
@@ -162,11 +193,7 @@ async fn main() -> Result<()> {
 
     // 如果启用了文件日志，添加文件输出（无颜色）
     if app_config.get_log_to_file() {
-        let log_file_path = if let Some(path) = app_config.get_log_file_path() {
-            PathBuf::from(path)
-        } else {
-            AppConfig::generate_default_log_path()
-        };
+        let log_file_path = app_config.generate_log_path();
 
         // 确保日志文件目录存在
         if let Some(parent) = log_file_path.parent() {

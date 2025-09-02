@@ -191,153 +191,132 @@ impl StripChatRecorder {
                 return Ok(());
             }
 
-            match self.check_status().await {
-                Ok(status) => {
-                    self.status = status.clone();
+            // 检查状态并处理状态变化日志
+            let status = match self.check_status_with_logging(&mut previous_status).await {
+                Ok(status) => status,
+                Err(e) => {
+                    error!("[{}] 检查状态失败: {}", self.config.username, e);
+                    StreamStatus::Error
+                }
+            };
 
-                    // 记录状态变化
-                    if std::mem::discriminant(&self.status)
-                        != std::mem::discriminant(&previous_status)
-                    {
-                        match self.status {
-                            StreamStatus::Public => info!("[{}] 直播已开始", self.config.username),
-                            StreamStatus::Private => {
-                                info!("[{}] 直播处于私人秀", self.config.username)
-                            }
-                            StreamStatus::Offline => info!("[{}] 直播已离线", self.config.username),
-                            StreamStatus::LongOffline => {
-                                info!("[{}] 直播已离线一段时间", self.config.username)
-                            }
-                            StreamStatus::Error => error!("[{}] 发生错误", self.config.username),
-                            StreamStatus::Unknown => {
-                                warn!("[{}] 未知直播状态", self.config.username)
-                            }
-                        }
-                        previous_status = self.status.clone();
-                    }
+            self.status = status.clone();
 
-                    match self.status {
-                        StreamStatus::Public => {
-                            offline_time = 0; // 重置离线计数器
+            match self.status {
+                StreamStatus::Public => {
+                    offline_time = 0; // 重置离线计数器
 
-                            // 为长时间录制会话启动 cookie 刷新任务
-                            let client_clone = self.client.clone();
-                            let username_clone = self.config.username.clone();
-                            let shutdown_rx_clone = if let Some(ref shutdown_rx) = self.shutdown_rx
-                            {
-                                Some(shutdown_rx.resubscribe())
-                            } else {
-                                None
-                            };
+                    // 为长时间录制会话启动 cookie 刷新任务
+                    let client_clone = self.client.clone();
+                    let username_clone = self.config.username.clone();
+                    let shutdown_rx_clone = if let Some(ref shutdown_rx) = self.shutdown_rx {
+                        Some(shutdown_rx.resubscribe())
+                    } else {
+                        None
+                    };
 
-                            tokio::spawn(async move {
-                                let mut interval =
-                                    tokio::time::interval(tokio::time::Duration::from_secs(600)); // 10分钟
+                    tokio::spawn(async move {
+                        let mut interval =
+                            tokio::time::interval(tokio::time::Duration::from_secs(600)); // 10分钟
 
-                                if let Some(mut shutdown_rx) = shutdown_rx_clone {
-                                    loop {
-                                        tokio::select! {
-                                            _ = interval.tick() => {
-                                                if let Err(e) =
-                                                    Self::refresh_cookies(&client_clone, &username_clone).await
-                                                {
-                                                    debug!("[{}] 刷新 cookie 失败: {}", username_clone, e);
-                                                } else {
-                                                    debug!("[{}] cookie 刷新成功", username_clone);
-                                                }
-                                            }
-                                            _ = shutdown_rx.recv() => {
-                                                debug!("[{}] cookie 刷新任务收到关闭信号", username_clone);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    // 没有关闭信号接收器的情况下，使用原有逻辑
-                                    loop {
-                                        interval.tick().await;
+                        if let Some(mut shutdown_rx) = shutdown_rx_clone {
+                            loop {
+                                tokio::select! {
+                                    _ = interval.tick() => {
                                         if let Err(e) =
-                                            Self::refresh_cookies(&client_clone, &username_clone)
-                                                .await
+                                            Self::refresh_cookies(&client_clone, &username_clone).await
                                         {
                                             debug!("[{}] 刷新 cookie 失败: {}", username_clone, e);
                                         } else {
                                             debug!("[{}] cookie 刷新成功", username_clone);
                                         }
                                     }
+                                    _ = shutdown_rx.recv() => {
+                                        debug!("[{}] cookie 刷新任务收到关闭信号", username_clone);
+                                        break;
+                                    }
                                 }
-                            });
+                            }
+                        } else {
+                            // 没有关闭信号接收器的情况下，使用原有逻辑
+                            loop {
+                                interval.tick().await;
+                                if let Err(e) =
+                                    Self::refresh_cookies(&client_clone, &username_clone).await
+                                {
+                                    debug!("[{}] 刷新 cookie 失败: {}", username_clone, e);
+                                } else {
+                                    debug!("[{}] cookie 刷新成功", username_clone);
+                                }
+                            }
+                        }
+                    });
 
-                            if let Err(e) = self.record_stream().await {
-                                error!("[{}] 录制失败: {}", self.config.username, e);
-                                self.status = StreamStatus::Error;
-                                if self
-                                    .interruptible_sleep(tokio::time::Duration::from_secs(20))
-                                    .await
-                                {
-                                    return Ok(());
-                                }
-                            }
-                        }
-                        StreamStatus::Private => {
-                            offline_time = 0; // 重置离线计数器
-                            if self
-                                .interruptible_sleep(tokio::time::Duration::from_secs(5))
-                                .await
-                            {
-                                return Ok(());
-                            }
-                        }
-                        StreamStatus::Offline => {
-                            offline_time += self.config.check_interval;
-                            if offline_time > long_offline_timeout {
-                                self.status = StreamStatus::LongOffline;
-                                if self
-                                    .interruptible_sleep(tokio::time::Duration::from_secs(300))
-                                    .await
-                                {
-                                    return Ok(());
-                                }
-                            } else {
-                                if self
-                                    .interruptible_sleep(tokio::time::Duration::from_secs(
-                                        self.config.check_interval,
-                                    ))
-                                    .await
-                                {
-                                    return Ok(());
-                                }
-                            }
-                        }
-                        StreamStatus::LongOffline => {
-                            if self
-                                .interruptible_sleep(tokio::time::Duration::from_secs(300))
-                                .await
-                            {
-                                return Ok(());
-                            }
-                        }
-                        StreamStatus::Error => {
-                            if self
-                                .interruptible_sleep(tokio::time::Duration::from_secs(20))
-                                .await
-                            {
-                                return Ok(());
-                            }
-                        }
-                        StreamStatus::Unknown => {
-                            if self
-                                .interruptible_sleep(tokio::time::Duration::from_secs(30))
-                                .await
-                            {
-                                return Ok(());
-                            }
+                    if let Err(e) = self.record_stream().await {
+                        error!("[{}] 录制失败: {}", self.config.username, e);
+                        self.status = StreamStatus::Error;
+                        if self
+                            .interruptible_sleep(tokio::time::Duration::from_secs(20))
+                            .await
+                        {
+                            return Ok(());
                         }
                     }
                 }
-                Err(e) => {
-                    error!("[{}] 检查状态失败: {}", self.config.username, e);
-                    self.status = StreamStatus::Error;
+                StreamStatus::Private => {
+                    offline_time = 0; // 重置离线计数器
+                    if self
+                        .interruptible_sleep(tokio::time::Duration::from_secs(5))
+                        .await
+                    {
+                        return Ok(());
+                    }
+                }
+                StreamStatus::Offline => {
+                    offline_time += self.config.check_interval;
+                    if offline_time > long_offline_timeout {
+                        self.status = StreamStatus::LongOffline;
+                        // 只有当状态实际变化时才记录日志
+                        if std::mem::discriminant(&StreamStatus::LongOffline)
+                            != std::mem::discriminant(&previous_status)
+                        {
+                            info!("[{}] 直播已离线一段时间", self.config.username);
+                            previous_status = StreamStatus::LongOffline;
+                        }
+                        if self
+                            .interruptible_sleep(tokio::time::Duration::from_secs(300))
+                            .await
+                        {
+                            return Ok(());
+                        }
+                    } else {
+                        if self
+                            .interruptible_sleep(tokio::time::Duration::from_secs(
+                                self.config.check_interval,
+                            ))
+                            .await
+                        {
+                            return Ok(());
+                        }
+                    }
+                }
+                StreamStatus::LongOffline => {
+                    if self
+                        .interruptible_sleep(tokio::time::Duration::from_secs(300))
+                        .await
+                    {
+                        return Ok(());
+                    }
+                }
+                StreamStatus::Error => {
+                    if self
+                        .interruptible_sleep(tokio::time::Duration::from_secs(20))
+                        .await
+                    {
+                        return Ok(());
+                    }
+                }
+                StreamStatus::Unknown => {
                     if self
                         .interruptible_sleep(tokio::time::Duration::from_secs(30))
                         .await
@@ -349,8 +328,11 @@ impl StripChatRecorder {
         }
     }
 
-    /// 检查直播状态
-    async fn check_status(&mut self) -> Result<StreamStatus> {
+    /// 检查直播状态并记录结果
+    async fn check_status_with_logging(
+        &mut self,
+        previous_status: &mut StreamStatus,
+    ) -> Result<StreamStatus> {
         let url = format!(
             "https://stripchat.com/api/vr/v2/models/username/{}",
             self.config.username
@@ -361,11 +343,22 @@ impl StripChatRecorder {
 
         let api_response: ApiResponse = match response.status() {
             reqwest::StatusCode::NOT_FOUND => {
+                let status = StreamStatus::Offline;
                 info!("[{}] 状态: 离线 (用户不存在)", self.config.username);
-                return Ok(StreamStatus::Offline);
+                // 只在状态变化时更新 previous_status
+                if std::mem::discriminant(&status) != std::mem::discriminant(previous_status) {
+                    *previous_status = status.clone();
+                }
+                return Ok(status);
             }
             status if !status.is_success() => {
+                let error_status = StreamStatus::Error;
                 error!("[{}] 状态: 错误 (HTTP {})", self.config.username, status);
+                // 只在状态变化时更新 previous_status
+                if std::mem::discriminant(&error_status) != std::mem::discriminant(previous_status)
+                {
+                    *previous_status = error_status.clone();
+                }
                 return Err(anyhow!("API 请求失败: {}", status));
             }
             _ => response.json().await?,
@@ -381,24 +374,45 @@ impl StripChatRecorder {
                     .filter(|cam| cam.is_cam_active)
                     .map_or(StreamStatus::Offline, |_| StreamStatus::Public);
 
+                // 每次都输出状态日志
                 match final_status {
                     StreamStatus::Public => info!("[{}] 状态: 公开直播", self.config.username),
                     StreamStatus::Offline => info!("[{}] 状态: 离线", self.config.username),
                     _ => {}
                 }
+                // 只在状态变化时更新 previous_status
+                if std::mem::discriminant(&final_status) != std::mem::discriminant(previous_status)
+                {
+                    *previous_status = final_status.clone();
+                }
                 final_status
             }
             "private" | "groupShow" | "p2p" | "virtualPrivate" | "p2pVoice" => {
+                let status = StreamStatus::Private;
                 info!("[{}] 状态: 私人秀", self.config.username);
-                StreamStatus::Private
+                // 只在状态变化时更新 previous_status
+                if std::mem::discriminant(&status) != std::mem::discriminant(previous_status) {
+                    *previous_status = status.clone();
+                }
+                status
             }
             "off" | "idle" => {
+                let status = StreamStatus::Offline;
                 info!("[{}] 状态: 离线", self.config.username);
-                StreamStatus::Offline
+                // 只在状态变化时更新 previous_status
+                if std::mem::discriminant(&status) != std::mem::discriminant(previous_status) {
+                    *previous_status = status.clone();
+                }
+                status
             }
             unknown_status => {
-                info!("[{}] 状态: 未知 ({})", self.config.username, unknown_status);
-                StreamStatus::Unknown
+                let status = StreamStatus::Unknown;
+                warn!("[{}] 状态: 未知 ({})", self.config.username, unknown_status);
+                // 只在状态变化时更新 previous_status
+                if std::mem::discriminant(&status) != std::mem::discriminant(previous_status) {
+                    *previous_status = status.clone();
+                }
+                status
             }
         };
 
