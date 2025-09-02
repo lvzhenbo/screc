@@ -16,7 +16,6 @@ jobs:
         target:
           - x86_64-pc-windows-gnu
           - x86_64-unknown-linux-musl
-          - aarch64-apple-darwin
 
     steps:
       - name: Checkout repository
@@ -39,4 +38,3 @@ jobs:
           path: |
             ${{ steps.compile.outputs.BUILT_ARCHIVE }}
             ${{ steps.compile.outputs.BUILT_CHECKSUM }}
-          retention-days: 30
