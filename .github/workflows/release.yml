@@ -1,0 +1,40 @@
+name: Release
+
+on:
+  release:
+    types: [created]
+
+jobs:
+  release:
+    name: Release ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-gnu
+            archive: zip
+            name: windows-x64
+          - target: x86_64-unknown-linux-musl
+            archive: tar.gz
+            name: linux-x64
+          - target: x86_64-apple-darwin
+            archive: zip
+            name: macos-x64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Compile and release
+        uses: rust-build/rust-build.action@v1.4.5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          RUSTTARGET: ${{ matrix.target }}
+          ARCHIVE_TYPES: ${{ matrix.archive }}
+          ARCHIVE_NAME: screc-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }}
+          EXTRA_FILES: "README.md LICENSE"
+          TOOLCHAIN_VERSION: stable
+          EXTRA_COMMAND_FLAGS: "--release"
+          MINIFY: true
