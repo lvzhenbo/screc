@@ -36,5 +36,4 @@ jobs:
           ARCHIVE_NAME: screc-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }}
           EXTRA_FILES: "README.md LICENSE"
           TOOLCHAIN_VERSION: stable
-          EXTRA_COMMAND_FLAGS: "--release"
           MINIFY: true

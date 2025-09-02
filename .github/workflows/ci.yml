@@ -31,7 +31,6 @@ jobs:
           EXTRA_FILES: "README.md LICENSE"
           ARCHIVE_TYPES: "zip"
           TOOLCHAIN_VERSION: stable
-          EXTRA_COMMAND_FLAGS: "--release"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
