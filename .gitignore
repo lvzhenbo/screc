@@ -1,0 +1,24 @@
+# Rust build files
+/target/
+Cargo.lock
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Downloads
+/downloads/
+/recordings/
+
+# Logs
+*.log
+
+# Environment files
+.env
+.env.local
