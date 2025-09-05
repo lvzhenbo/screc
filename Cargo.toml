@@ -22,10 +22,10 @@ m3u8-rs = "6.0"
 url = "2.5.7"
 chrono = { version = "0.4.41", features = ["serde"] }
 anyhow = "1.0.99"
-log = "0.4.27"
+log = "0.4.28"
 fern = "0.7.1"
 colored = "3.0.0"
-clap = { version = "4.5.46", features = ["derive"] }
+clap = { version = "4.5.47", features = ["derive"] }
 
 # 二进制大小优化配置
 [profile.release]
