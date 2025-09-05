@@ -332,7 +332,7 @@ impl StripChatRecorder {
 
                     tokio::spawn(async move {
                         let mut interval =
-                            tokio::time::interval(tokio::time::Duration::from_secs(600)); // 10分钟
+                            tokio::time::interval(tokio::time::Duration::from_secs(1800)); // 30分钟改为更合理的间隔
 
                         if let Some(mut shutdown_rx) = shutdown_rx_clone {
                             loop {
