@@ -7,15 +7,17 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use colored::Colorize;
 use config::{AppConfig, CliArgs, Config};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use std::path::PathBuf;
+use std::sync::Arc;
 use stripchat::StripChatRecorder;
-use tokio::sync::broadcast;
+use tokio::sync::{Mutex, broadcast};
 use utils::{ProxyConfig, get_proxy_from_env};
 
 #[derive(Parser)]
 #[command(name = "screc")]
 #[command(about = "基于 Rust 的 StripChat 直播录制工具")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
 struct Cli {
     /// 配置文件路径，默认为程序同目录下的 config.json
     #[arg(short, long)]
@@ -61,6 +63,10 @@ struct Cli {
     #[arg(long)]
     log_file: Option<String>,
 
+    /// Cookie 字符串 (例如: "key1=value1; key2=value2")
+    #[arg(long)]
+    cookies: Option<String>,
+
     /// 生成默认配置文件，可选择指定配置文件名（默认为 config.json）
     #[arg(long, num_args = 0..=1, default_missing_value = "config.json")]
     generate_config: Option<String>,
@@ -80,6 +86,7 @@ impl From<&Cli> for CliArgs {
             proxy_password: cli.proxy_password.clone(),
             log_to_file: cli.log_to_file,
             log_file_path: cli.log_file.clone(),
+            cookies: cli.cookies.clone(),
         }
     }
 }
@@ -144,16 +151,21 @@ async fn main() -> Result<()> {
 
     let mut app_config = if config_path.exists() {
         AppConfig::from_file(&config_path)
-            .inspect(|_| info!("已加载配置文件: {}", config_path.display()))
+            .inspect(|_| debug!("已加载配置文件: {}", config_path.display()))
             .inspect_err(|e| warn!("加载配置文件失败: {}，使用默认配置", e))
             .unwrap_or_default()
     } else {
-        info!("配置文件不存在，使用默认配置: {}", config_path.display());
+        debug!("配置文件不存在，使用默认配置: {}", config_path.display());
         AppConfig::default()
     };
 
     // 合并命令行参数
     let cli_args = CliArgs::from(&cli);
+
+    // 检查cookie来源
+    let has_cli_cookies = cli_args.cookies.is_some();
+    let original_config_cookies = app_config.cookies.clone();
+
     app_config.merge_with_cli(&cli_args);
 
     // 初始化日志
@@ -268,9 +280,9 @@ async fn main() -> Result<()> {
 
         // 根据是否有认证信息显示不同的日志
         if proxy.username.is_some() && proxy.password.is_some() {
-            info!("使用认证代理: {}", proxy.url);
+            debug!("使用认证代理: {}", proxy.url);
         } else {
-            info!("使用代理: {}", proxy.url);
+            debug!("使用代理: {}", proxy.url);
         }
     }
 
@@ -280,25 +292,42 @@ async fn main() -> Result<()> {
     // 创建关闭信号
     let (shutdown_tx, _) = broadcast::channel(1);
 
+    // 将app_config包装在Arc<Mutex>中以便在多个任务间共享
+    let shared_app_config = Arc::new(Mutex::new(app_config));
+    let shared_config_path = if config_path.exists() {
+        Some(config_path.clone())
+    } else {
+        None
+    };
+
     for username in usernames {
-        let config = Config {
-            username: username.clone(),
-            output_dir: app_config.get_output_dir(),
-            resolution: app_config.get_resolution(),
-            check_interval: app_config.get_check_interval(),
-            proxy: proxy_config.as_ref().map(|p| p.url.clone()),
-            proxy_username: proxy_config.as_ref().and_then(|p| p.username.clone()),
-            proxy_password: proxy_config.as_ref().and_then(|p| p.password.clone()),
-        };
+        let config = Config::from_app_config(
+            &*shared_app_config.lock().await,
+            username.clone(),
+            proxy_config.as_ref().map(|p| p.url.clone()),
+            proxy_config.as_ref().and_then(|p| p.username.clone()),
+            proxy_config.as_ref().and_then(|p| p.password.clone()),
+        );
 
         info!("为用户 {} 创建录制任务", username);
 
         let shutdown_rx = shutdown_tx.subscribe();
+        let shared_app_config_clone = shared_app_config.clone();
+        let shared_config_path_clone = shared_config_path.clone();
+        let original_config_cookies_clone = original_config_cookies.clone();
         let recorder_task = tokio::spawn(async move {
-            match StripChatRecorder::new(config).await {
+            match StripChatRecorder::new(
+                config,
+                shared_app_config_clone,
+                shared_config_path_clone,
+                has_cli_cookies,
+                original_config_cookies_clone,
+            )
+            .await
+            {
                 Ok(mut recorder) => {
                     recorder.set_shutdown_receiver(shutdown_rx);
-                    info!("开始为用户 {} 录制 StripChat 直播", username);
+                    debug!("开始为用户 {} 录制 StripChat 直播", username);
                     if let Err(e) = recorder.start_recording().await {
                         error!("用户 {} 录制失败: {}", username, e);
                     }

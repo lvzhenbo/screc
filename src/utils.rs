@@ -57,16 +57,32 @@ pub fn get_proxy_from_env() -> Option<String> {
         .find_map(|var| env::var(var).ok())
 }
 
-/// 创建带有代理配置的 HTTP 客户端
-pub fn create_client_with_proxy(
+/// 创建带有代理配置和Cookie的 HTTP 客户端
+pub fn create_client(
     proxy_url: Option<&str>,
     proxy_username: Option<&str>,
     proxy_password: Option<&str>,
     user_agent: &str,
-) -> Result<Client> {
+    cookies: Option<&str>,
+) -> Result<(Client, Arc<Jar>)> {
     let jar = Arc::new(Jar::default());
+
+    // 如果提供了cookies，解析并添加到cookie jar中
+    if let Some(cookies_str) = cookies {
+        let stripchat_url = "https://stripchat.com".parse::<Url>().unwrap();
+
+        // 解析cookie字符串格式：key1=value1; key2=value2
+        for cookie_pair in cookies_str.split(';') {
+            let cookie_pair = cookie_pair.trim();
+            if !cookie_pair.is_empty() {
+                let header_value = format!("{}; Domain=stripchat.com; Path=/", cookie_pair);
+                jar.add_cookie_str(&header_value, &stripchat_url);
+            }
+        }
+    }
+
     let mut client_builder = Client::builder()
-        .cookie_provider(jar)
+        .cookie_provider(jar.clone())
         .user_agent(user_agent);
 
     // 如果提供了代理，则配置代理
@@ -83,5 +99,5 @@ pub fn create_client_with_proxy(
         client_builder = client_builder.proxy(proxy);
     }
 
-    Ok(client_builder.build()?)
+    Ok((client_builder.build()?, jar))
 }

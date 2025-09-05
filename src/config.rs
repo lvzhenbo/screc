@@ -15,6 +15,7 @@ pub struct AppConfig {
     pub user_agent: Option<String>,     // 用户代理
     pub log_to_file: Option<bool>,      // 是否输出日志到文件
     pub log_file_path: Option<String>,  // 日志文件路径
+    pub cookies: Option<String>,        // Cookie 字符串
 }
 
 impl Default for AppConfig {
@@ -31,6 +32,7 @@ impl Default for AppConfig {
             user_agent: Some("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36".to_string()),
             log_to_file: Some(true),
             log_file_path: Some("logs".to_string()),
+            cookies: None,
         }
     }
 }
@@ -100,6 +102,7 @@ impl AppConfig {
             .or(self.proxy_password.take());
         self.log_to_file = cli_args.log_to_file.or(self.log_to_file);
         self.log_file_path = cli_args.log_file_path.clone().or(self.log_file_path.take());
+        self.cookies = cli_args.cookies.clone().or(self.cookies.take());
     }
 
     /// 获取最终配置值，如果字段为None则使用默认值
@@ -141,12 +144,22 @@ impl AppConfig {
         self.proxy_password.clone()
     }
 
+    pub fn get_cookies(&self) -> Option<String> {
+        self.cookies.clone()
+    }
+
     pub fn get_log_to_file(&self) -> bool {
         self.log_to_file.unwrap_or(true)
     }
 
     pub fn get_log_file_path(&self) -> String {
         self.log_file_path.as_deref().unwrap_or("logs").to_string()
+    }
+
+    pub fn get_user_agent(&self) -> String {
+        self.user_agent.as_deref().unwrap_or(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        ).to_string()
     }
 
     /// 生成默认的日志文件路径
@@ -165,13 +178,6 @@ impl AppConfig {
         // 如果获取失败，使用当前工作目录的logs文件夹
         PathBuf::from(&log_dir).join(filename)
     }
-
-    #[allow(dead_code)]
-    pub fn get_user_agent(&self) -> String {
-        self.user_agent.as_deref().unwrap_or(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-        ).to_string()
-    }
 }
 
 /// 命令行参数结构
@@ -189,6 +195,7 @@ pub struct CliArgs {
     pub proxy_password: Option<String>, // 代理密码
     pub log_to_file: Option<bool>,      // 是否输出日志到文件
     pub log_file_path: Option<String>,  // 日志文件路径
+    pub cookies: Option<String>,        // Cookie 字符串
 }
 
 #[derive(Debug, Clone)]
@@ -200,10 +207,29 @@ pub struct Config {
     pub proxy: Option<String>,          // 代理地址
     pub proxy_username: Option<String>, // 代理用户名
     pub proxy_password: Option<String>, // 代理密码
+    pub cookies: Option<String>,        // Cookie 字符串
+    pub user_agent: String,             // 用户代理
 }
 
 impl Config {
-    pub fn user_agent() -> &'static str {
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    /// 从 AppConfig 创建运行时配置
+    pub fn from_app_config(
+        app_config: &AppConfig,
+        username: String,
+        proxy: Option<String>,
+        proxy_username: Option<String>,
+        proxy_password: Option<String>,
+    ) -> Self {
+        Self {
+            username,
+            output_dir: app_config.get_output_dir(),
+            resolution: app_config.get_resolution(),
+            check_interval: app_config.get_check_interval(),
+            proxy,
+            proxy_username,
+            proxy_password,
+            cookies: app_config.get_cookies(),
+            user_agent: app_config.get_user_agent(),
+        }
     }
 }

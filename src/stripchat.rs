@@ -2,15 +2,20 @@ use anyhow::{Result, anyhow};
 use base64::{Engine as _, engine::general_purpose};
 use chrono::Utc;
 use log::{debug, error, info, warn};
-use reqwest::Client;
+use reqwest::{
+    Client,
+    cookie::{CookieStore, Jar},
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
-use tokio::sync::broadcast;
+use std::sync::Arc;
+use tokio::sync::{Mutex, broadcast};
+use url::Url;
 
-use crate::config::Config;
+use crate::config::{AppConfig, Config};
 use crate::downloader::HlsDownloader;
-use crate::utils::create_client_with_proxy;
+use crate::utils::create_client;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StreamStatus {
@@ -20,6 +25,13 @@ pub enum StreamStatus {
     LongOffline, // 长时间离线
     Error,       // 错误
     Unknown,     // 未知
+}
+
+#[derive(Debug, Clone)]
+enum CookieSource {
+    ConfigFile,  // 来自配置文件
+    CommandLine, // 来自命令行参数
+    None,        // 没有cookie
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -51,6 +63,10 @@ struct PlaylistVariant {
 
 pub struct StripChatRecorder {
     config: Config,                               // 配置
+    app_config: Arc<Mutex<AppConfig>>,            // 全局配置
+    config_file_path: Option<PathBuf>,            // 配置文件路径
+    cookie_source: CookieSource,                  // Cookie来源
+    cookie_jar: Arc<Jar>,                         // Cookie存储
     client: Client,                               // HTTP客户端
     last_info: Option<ApiResponse>,               // 最后一次API响应
     psch: Option<String>,                         // PSCH参数
@@ -61,17 +77,37 @@ pub struct StripChatRecorder {
 
 impl StripChatRecorder {
     /// 创建新的 StripChat 录制器实例
-    pub async fn new(config: Config) -> Result<Self> {
+    pub async fn new(
+        config: Config,
+        app_config: Arc<Mutex<AppConfig>>,
+        config_file_path: Option<PathBuf>,
+        cli_has_cookies: bool,
+        original_config_cookies: Option<String>,
+    ) -> Result<Self> {
+        // 确定cookie来源
+        let cookie_source = if cli_has_cookies {
+            CookieSource::CommandLine
+        } else if original_config_cookies.is_some() {
+            CookieSource::ConfigFile
+        } else {
+            CookieSource::None
+        };
+
         // 使用统一的代理客户端创建函数
-        let client = create_client_with_proxy(
+        let (client, cookie_jar) = create_client(
             config.proxy.as_deref(),
             config.proxy_username.as_deref(),
             config.proxy_password.as_deref(),
-            Config::user_agent(),
+            &config.user_agent,
+            config.cookies.as_deref(),
         )?;
 
         let instance = Self {
             config,
+            app_config: app_config.clone(),
+            config_file_path,
+            cookie_source,
+            cookie_jar,
             client,
             last_info: None,
             psch: None,
@@ -80,8 +116,22 @@ impl StripChatRecorder {
             shutdown_rx: None,
         };
 
-        // 通过访问主页初始化 cookies
-        instance.initialize_cookies().await?;
+        // 根据cookie来源处理初始化
+        match instance.cookie_source {
+            CookieSource::None => {
+                debug!(
+                    "[{}] 没有配置cookie，将获取并保存到配置文件",
+                    instance.config.username
+                );
+                instance.initialize_cookies().await?;
+            }
+            CookieSource::ConfigFile => {
+                debug!("[{}] 使用配置文件中的cookies", instance.config.username);
+            }
+            CookieSource::CommandLine => {
+                debug!("[{}] 使用命令行传入的cookies", instance.config.username);
+            }
+        }
 
         Ok(instance)
     }
@@ -142,6 +192,56 @@ impl StripChatRecorder {
         }
     }
 
+    /// 将cookies保存到配置中
+    async fn save_cookies_to_config(&self) -> Result<()> {
+        // 从client的cookie存储中获取cookies
+        let cookies = self.extract_cookies_from_client().await?;
+
+        if !cookies.is_empty() {
+            // 更新AppConfig中的cookies
+            let mut app_config = self.app_config.lock().await;
+            app_config.cookies = Some(cookies.clone());
+
+            // 如果有配置文件路径，保存到文件
+            if let Some(config_path) = &self.config_file_path {
+                if let Err(e) = app_config.save_to_file(config_path) {
+                    debug!("[{}] 保存配置文件失败: {}", self.config.username, e);
+                } else {
+                    debug!(
+                        "[{}] 配置文件已更新: {}",
+                        self.config.username,
+                        config_path.display()
+                    );
+                }
+            }
+
+            debug!("[{}] cookies已更新到配置", self.config.username);
+        }
+
+        Ok(())
+    }
+
+    /// 从HTTP客户端提取cookies
+    async fn extract_cookies_from_client(&self) -> Result<String> {
+        let stripchat_url = "https://stripchat.com"
+            .parse::<Url>()
+            .map_err(|e| anyhow!("解析URL失败: {}", e))?;
+
+        // 使用CookieStore trait方法从cookie jar中获取cookies
+        if let Some(cookie_header) = self.cookie_jar.cookies(&stripchat_url) {
+            if let Ok(cookie_str) = cookie_header.to_str() {
+                debug!(
+                    "[{}] 从cookie jar提取到的cookies: {}",
+                    self.config.username, cookie_str
+                );
+                return Ok(cookie_str.to_string());
+            }
+        }
+
+        debug!("[{}] cookie jar中没有找到cookies", self.config.username);
+        Ok(String::new())
+    }
+
     /// 通过访问主页初始化 cookies
     async fn initialize_cookies(&self) -> Result<()> {
         let website_url = format!("https://stripchat.com/{}", self.config.username);
@@ -165,7 +265,19 @@ impl StripChatRecorder {
             .await?;
 
         if response.status().is_success() {
-            debug!("[{}] 成功访问主页并获取 cookie", self.config.username);
+            // 只有在没有配置cookie时才获取并保存cookies到配置中
+            match self.cookie_source {
+                CookieSource::None => {
+                    if let Err(e) = self.save_cookies_to_config().await {
+                        debug!("[{}] 保存cookies到配置失败: {}", self.config.username, e);
+                    } else {
+                        debug!("[{}] 成功获取并保存cookies到配置", self.config.username);
+                    }
+                }
+                _ => {
+                    debug!("[{}] 使用现有cookies，无需获取新的", self.config.username);
+                }
+            }
         } else {
             warn!(
                 "[{}] 访问主页失败: {}",
@@ -179,7 +291,7 @@ impl StripChatRecorder {
 
     /// 开始录制循环
     pub async fn start_recording(&mut self) -> Result<()> {
-        info!("开始为用户 {} 录制循环", self.config.username);
+        debug!("开始为用户 {} 录制循环", self.config.username);
 
         let mut offline_time = 0u64;
         let long_offline_timeout = 600u64; // 10分钟
@@ -208,6 +320,9 @@ impl StripChatRecorder {
 
                     // 为长时间录制会话启动 cookie 刷新任务
                     let client_clone = self.client.clone();
+                    let app_config_clone = self.app_config.clone();
+                    let config_file_path_clone = self.config_file_path.clone();
+                    let cookie_source_clone = self.cookie_source.clone();
                     let username_clone = self.config.username.clone();
                     let shutdown_rx_clone = if let Some(ref shutdown_rx) = self.shutdown_rx {
                         Some(shutdown_rx.resubscribe())
@@ -224,11 +339,18 @@ impl StripChatRecorder {
                                 tokio::select! {
                                     _ = interval.tick() => {
                                         if let Err(e) =
-                                            Self::refresh_cookies(&client_clone, &username_clone).await
+                                            Self::refresh_cookies_and_save(&client_clone, &username_clone, &app_config_clone, &config_file_path_clone, &cookie_source_clone).await
                                         {
                                             debug!("[{}] 刷新 cookie 失败: {}", username_clone, e);
                                         } else {
-                                            debug!("[{}] cookie 刷新成功", username_clone);
+                                            match cookie_source_clone {
+                                                CookieSource::CommandLine => {
+                                                    debug!("[{}] cookie 刷新成功（未保存到配置文件）", username_clone);
+                                                }
+                                                _ => {
+                                                    debug!("[{}] cookie 刷新并保存成功", username_clone);
+                                                }
+                                            }
                                         }
                                     }
                                     _ = shutdown_rx.recv() => {
@@ -241,12 +363,28 @@ impl StripChatRecorder {
                             // 没有关闭信号接收器的情况下，使用原有逻辑
                             loop {
                                 interval.tick().await;
-                                if let Err(e) =
-                                    Self::refresh_cookies(&client_clone, &username_clone).await
+                                if let Err(e) = Self::refresh_cookies_and_save(
+                                    &client_clone,
+                                    &username_clone,
+                                    &app_config_clone,
+                                    &config_file_path_clone,
+                                    &cookie_source_clone,
+                                )
+                                .await
                                 {
                                     debug!("[{}] 刷新 cookie 失败: {}", username_clone, e);
                                 } else {
-                                    debug!("[{}] cookie 刷新成功", username_clone);
+                                    match cookie_source_clone {
+                                        CookieSource::CommandLine => {
+                                            debug!(
+                                                "[{}] cookie 刷新成功（未保存到配置文件）",
+                                                username_clone
+                                            );
+                                        }
+                                        _ => {
+                                            debug!("[{}] cookie 刷新并保存成功", username_clone);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -339,7 +477,19 @@ impl StripChatRecorder {
         );
         debug!("[{}] 检查状态: {}", self.config.username, url);
 
-        let response = self.client.get(&url).send().await?;
+        // 可中断的网络请求
+        let response = if let Some(ref mut shutdown_rx) = self.shutdown_rx {
+            let mut shutdown_rx = shutdown_rx.resubscribe();
+            tokio::select! {
+                response = self.client.get(&url).send() => response?,
+                _ = shutdown_rx.recv() => {
+                    info!("[{}] 状态检查期间收到关闭信号", self.config.username);
+                    return Err(anyhow!("收到关闭信号，中断状态检查"));
+                }
+            }
+        } else {
+            self.client.get(&url).send().await?
+        };
 
         let api_response: ApiResponse = match response.status() {
             reqwest::StatusCode::NOT_FOUND => {
@@ -477,7 +627,20 @@ impl StripChatRecorder {
 
         debug!("[{}] 获取主播放列表: {}", self.config.username, master_url);
 
-        let response = self.client.get(&master_url).send().await?;
+        // 可中断的网络请求
+        let response = if let Some(ref mut shutdown_rx) = self.shutdown_rx {
+            let mut shutdown_rx = shutdown_rx.resubscribe();
+            tokio::select! {
+                response = self.client.get(&master_url).send() => response?,
+                _ = shutdown_rx.recv() => {
+                    info!("[{}] 获取播放列表期间收到关闭信号", self.config.username);
+                    return Err(anyhow!("收到关闭信号，中断播放列表获取"));
+                }
+            }
+        } else {
+            self.client.get(&master_url).send().await?
+        };
+
         if !response.status().is_success() {
             return Err(anyhow!("获取主播放列表失败: {}", response.status()));
         }
@@ -680,14 +843,21 @@ impl StripChatRecorder {
         String::from_utf8(decrypted_bytes).map_err(|e| anyhow!("UTF-8 解码错误: {}", e))
     }
 
-    /// 刷新 cookies
-    async fn refresh_cookies(client: &Client, username: &str) -> Result<()> {
+    /// 刷新 cookies 并保存到配置
+    async fn refresh_cookies_and_save(
+        client: &Client,
+        username: &str,
+        app_config: &Arc<Mutex<AppConfig>>,
+        config_file_path: &Option<PathBuf>,
+        cookie_source: &CookieSource,
+    ) -> Result<()> {
         let website_url = format!("https://stripchat.com/{}", username);
         debug!(
             "[{}] 通过访问以下地址刷新 cookie: {}",
             username, website_url
         );
 
+        // 发送请求以刷新cookies
         let response = client
             .get(&website_url)
             .header(
@@ -702,7 +872,65 @@ impl StripChatRecorder {
             .await?;
 
         if response.status().is_success() {
-            debug!("[{}] cookie 刷新成功", username);
+            // 提取新的cookies
+            let mut new_cookies = Vec::new();
+
+            // 从响应头中提取Set-Cookie
+            for (name, value) in response.headers().iter() {
+                if name.as_str().to_lowercase() == "set-cookie" {
+                    if let Ok(cookie_str) = value.to_str() {
+                        // 提取cookie的键值对（去掉额外的属性如path, domain等）
+                        if let Some(cookie_part) = cookie_str.split(';').next() {
+                            new_cookies.push(cookie_part.to_string());
+                        }
+                    }
+                }
+            }
+
+            // 如果没有从Set-Cookie头获取到新cookies，尝试从现有的cookie jar中获取
+            if new_cookies.is_empty() {
+                // 创建一个新的请求来检查当前的cookie状态
+                let test_request = client.head(&website_url).build()?;
+
+                if let Some(cookie_header) = test_request.headers().get("cookie") {
+                    if let Ok(cookie_str) = cookie_header.to_str() {
+                        // 将整个cookie字符串作为一个条目
+                        new_cookies.push(cookie_str.to_string());
+                    }
+                }
+            }
+
+            if !new_cookies.is_empty() {
+                let cookies_string = new_cookies.join("; ");
+
+                // 只有在非命令行cookie时才保存到配置文件
+                match cookie_source {
+                    CookieSource::CommandLine => {
+                        debug!(
+                            "[{}] cookie 刷新成功（来自命令行，不保存到配置文件）",
+                            username
+                        );
+                    }
+                    CookieSource::ConfigFile | CookieSource::None => {
+                        // 更新AppConfig中的cookies
+                        let mut app_config_guard = app_config.lock().await;
+                        app_config_guard.cookies = Some(cookies_string);
+
+                        // 如果有配置文件路径，保存到文件
+                        if let Some(config_path) = config_file_path {
+                            if let Err(e) = app_config_guard.save_to_file(config_path) {
+                                debug!("[{}] 保存配置文件失败: {}", username, e);
+                            } else {
+                                debug!("[{}] 配置文件已更新: {}", username, config_path.display());
+                            }
+                        }
+
+                        debug!("[{}] cookie 刷新并保存成功", username);
+                    }
+                }
+            } else {
+                debug!("[{}] 未获取到新的cookies", username);
+            }
         } else {
             warn!("[{}] cookie 刷新失败: {}", username, response.status());
         }

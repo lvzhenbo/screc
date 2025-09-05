@@ -94,7 +94,7 @@ impl HlsDownloader {
     where
         F: Fn(&str) -> String,
     {
-        info!("[{}] 开始 HLS 下载到: {:?}", self.username, output_path);
+        debug!("[{}] 开始 HLS 下载到: {:?}", self.username, output_path);
 
         // 为原始 MP4 分片创建临时文件（fMP4）
         let temp_path = output_path.with_extension("tmp.mp4");
@@ -231,7 +231,7 @@ impl HlsDownloader {
 
         // 只有在实际下载了内容时才进行转换
         if has_downloaded_content {
-            info!("[{}] 正在将录制内容转换为 MP4 格式...", self.username);
+            debug!("[{}] 正在将录制内容转换为 MP4 格式...", self.username);
             match self.convert_ts_to_mp4(&temp_path, output_path).await {
                 Ok(()) => {
                     info!("[{}] 视频转换成功完成", self.username);
@@ -242,7 +242,7 @@ impl HlsDownloader {
                 }
             }
         } else {
-            info!("[{}] 没有下载任何内容，跳过视频转换", self.username);
+            debug!("[{}] 没有下载任何内容，跳过视频转换", self.username);
         }
 
         // 清理临时文件
@@ -325,7 +325,7 @@ impl HlsDownloader {
                 debug!("[{}] 下载初始化分片: {}", self.username, init_url);
                 match self.download_segment(&init_url, output_file).await {
                     Ok(()) => {
-                        info!("[{}] 初始化分片下载成功", self.username);
+                        debug!("[{}] 初始化分片下载成功", self.username);
                         self.init_segment_downloaded = true;
                         has_new_content = true; // 标记已下载初始化分片
                     }
@@ -524,7 +524,7 @@ impl HlsDownloader {
     async fn convert_ts_to_mp4(&self, input_path: &Path, output_path: &Path) -> Result<()> {
         use std::process::Command;
 
-        info!("[{}] 使用 FFmpeg 将 fMP4 转换为 MP4...", self.username);
+        debug!("[{}] 使用 FFmpeg 将 fMP4 转换为 MP4...", self.username);
 
         let output = Command::new("ffmpeg")
             .arg("-i")
