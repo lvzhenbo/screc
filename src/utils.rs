@@ -72,20 +72,11 @@ pub fn create_client(
         let stripchat_url = "https://stripchat.com".parse::<Url>().unwrap();
 
         // 解析cookie字符串格式：key1=value1; key2=value2
-        // 使用 HashSet 来避免重复的 cookie
-        let mut unique_cookies = std::collections::HashSet::new();
-
         for cookie_pair in cookies_str.split(';') {
             let cookie_pair = cookie_pair.trim();
             if !cookie_pair.is_empty() {
-                // 提取 cookie 名称用于去重
-                if let Some(cookie_name) = cookie_pair.split('=').next() {
-                    let cookie_name = cookie_name.trim();
-                    if unique_cookies.insert(cookie_name.to_string()) {
-                        let header_value = format!("{}; Domain=stripchat.com; Path=/", cookie_pair);
-                        jar.add_cookie_str(&header_value, &stripchat_url);
-                    }
-                }
+                let header_value = format!("{}; Domain=stripchat.com; Path=/", cookie_pair);
+                jar.add_cookie_str(&header_value, &stripchat_url);
             }
         }
     }
