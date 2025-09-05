@@ -79,24 +79,28 @@ screc --usernames "streamer1" --log-to-file false
 
 # 指定自定义日志文件
 screc --usernames "streamer1" --log-file ./my-log.log
+
+# 使用 cookies
+screc --usernames "streamer1" --cookies "session_id=abc123; user_token=xyz789"
 ```
 
 ## 命令行参数
 
-| 参数                | 短参数 | 类型   | 默认值         | 描述                                       |
-| ------------------- | ------ | ------ | -------------- | ------------------------------------------ |
-| `--config`          | `-c`   | String | `config.json`  | 配置文件路径                               |
-| `--usernames`       | `-u`   | String | -              | 要录制的用户名，多个用逗号分隔             |
-| `--output-dir`      | `-o`   | String | `downloads`    | 录制文件输出目录                           |
-| `--resolution`      | `-r`   | u32    | `1080`         | 期望的视频分辨率高度 (如 720, 1080)        |
-| `--check-interval`  | -      | u64    | `30`           | 离线时的检查间隔（秒）                     |
-| `--debug`           | `-d`   | Flag   | `false`        | 启用调试日志输出                           |
-| `--proxy`           | -      | String | -              | 代理服务器 URL                             |
-| `--proxy-username`  | -      | String | -              | 代理认证用户名                             |
-| `--proxy-password`  | -      | String | -              | 代理认证密码                               |
-| `--log-to-file`     | -      | Flag   | `true`         | 是否输出日志到文件                         |
-| `--log-file`        | -      | String | auto-generated | 日志文件路径                               |
-| `--generate-config` | -      | String | `config.json`  | 生成默认配置文件，可指定文件名（独立功能） |
+| 参数                | 短参数 | 类型   | 默认值         | 描述                                             |
+| ------------------- | ------ | ------ | -------------- | ------------------------------------------------ |
+| `--config`          | `-c`   | String | `config.json`  | 配置文件路径                                     |
+| `--usernames`       | `-u`   | String | -              | 要录制的用户名，多个用逗号分隔                   |
+| `--output-dir`      | `-o`   | String | `downloads`    | 录制文件输出目录                                 |
+| `--resolution`      | `-r`   | u32    | `1080`         | 期望的视频分辨率高度 (如 720, 1080)              |
+| `--check-interval`  | -      | u64    | `30`           | 离线时的检查间隔（秒）                           |
+| `--debug`           | `-d`   | Flag   | `false`        | 启用调试日志输出                                 |
+| `--proxy`           | -      | String | -              | 代理服务器 URL                                   |
+| `--proxy-username`  | -      | String | -              | 代理认证用户名                                   |
+| `--proxy-password`  | -      | String | -              | 代理认证密码                                     |
+| `--log-to-file`     | -      | Flag   | `true`         | 是否输出日志到文件                               |
+| `--log-file`        | -      | String | auto-generated | 日志文件路径                                     |
+| `--cookies`         | -      | String | -              | Cookie 字符串 (格式: "key1=value1; key2=value2") |
+| `--generate-config` | -      | String | `config.json`  | 生成默认配置文件，可指定文件名（独立功能）       |
 
 ## 配置文件
 
@@ -136,6 +140,7 @@ screc --generate-config ./configs/prod-config.json
 | `user_agent`     | String        | `"Mozilla/5.0..."` | HTTP 请求用户代理字符串 |
 | `log_to_file`    | Boolean       | `true`             | 是否输出日志到文件      |
 | `log_file_path`  | String        | `"logs"`           | 日志文件目录路径        |
+| `cookies`        | String/null   | `null`             | Cookie 字符串           |
 
 ### 配置文件示例
 
@@ -151,7 +156,8 @@ screc --generate-config ./configs/prod-config.json
   "proxy_password": null,
   "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
   "log_to_file": true,
-  "log_file_path": "logs"
+  "log_file_path": "logs",
+  "cookies": "session_id=abc123; user_token=xyz789"
 }
 ```
 
@@ -207,6 +213,57 @@ screc --usernames "streamer1" --log-file "my-log.log"
 }
 ```
 
+## Cookie 支持
+
+screc 支持使用 cookies 来访问需要身份认证的内容。Cookie 功能主要用于：
+
+- 访问私人直播或会员专用内容
+- 绕过某些地区限制
+- 提高 API 请求成功率
+
+### Cookie 配置方式
+
+1. **命令行参数** (优先级最高):
+
+```bash
+screc --usernames "streamer1" --cookies "session_id=abc123; user_token=xyz789"
+```
+
+2. **配置文件**:
+
+```json
+{
+  "cookies": "session_id=abc123; user_token=xyz789; preference=enabled"
+}
+```
+
+### Cookie 格式
+
+Cookie 字符串应遵循标准的 HTTP Cookie 格式：
+
+- 多个 cookie 用分号和空格分隔：`"key1=value1; key2=value2"`
+- 单个 cookie 格式：`"key=value"`
+
+### 获取 Cookie
+
+1. **浏览器开发者工具**:
+
+   - 打开浏览器访问 StripChat
+   - 按 F12 打开开发者工具
+   - 切换到 Network 标签页
+   - 刷新页面，查看任一请求的请求头
+   - 复制 Cookie 头的值
+
+2. **浏览器插件**:
+   - 使用如 "Cookie Editor" 等浏览器插件
+   - 导出相关站点的 cookies
+
+**注意**:
+
+- Cookie 可能包含敏感信息，请妥善保管
+- Cookie 有过期时间，可能需要定期更新
+- 使用 Cookie 需要遵守网站的使用条款
+
 ## 代理支持
 
 screc 具有统一的代理配置系统，支持多种代理类型和认证方式。
@@ -256,14 +313,15 @@ export HTTPS_PROXY=https://proxy.example.com:8080
 
 程序的录制流程如下：
 
-1. **状态监控** - 程序定期调用 StripChat API 检查主播状态
-2. **自动触发** - 检测到公开直播时立即开始录制
-3. **流获取** - 获取 HLS 视频流 URL 和播放列表
-4. **分辨率选择** - 根据用户设置自动选择最佳分辨率
-5. **分片下载** - 下载 M3U8 播放列表中的视频分片
-6. **解密处理** - 自动处理 MOUFLON 加密的视频分片
-7. **重试机制** - 分片失败时自动重试，网络中断时恢复下载
-8. **格式转换** - 使用 FFmpeg 将分片合并为 MP4 文件
+1. **初始化配置** - 加载配置文件和命令行参数，设置代理和认证信息（包括 cookies）
+2. **状态监控** - 程序定期调用 StripChat API 检查主播状态（使用配置的 cookies 进行认证）
+3. **自动触发** - 检测到公开直播时立即开始录制
+4. **流获取** - 获取 HLS 视频流 URL 和播放列表
+5. **分辨率选择** - 根据用户设置自动选择最佳分辨率
+6. **分片下载** - 下载 M3U8 播放列表中的视频分片
+7. **解密处理** - 自动处理 MOUFLON 加密的视频分片
+8. **重试机制** - 分片失败时自动重试，网络中断时恢复下载
+9. **格式转换** - 使用 FFmpeg 将分片合并为 MP4 文件
 
 ## 直播状态识别
 
@@ -404,6 +462,26 @@ logs/
 
 - 尝试更换其他代理服务器
 - 检查代理服务器的网络状况
+
+### Cookie 相关问题
+
+**Cookie 认证失败**
+
+- 检查 Cookie 格式是否正确（应为 "key1=value1; key2=value2" 格式）
+- 确认 Cookie 是否已过期，尝试重新获取
+- 验证从正确的网站域名获取 Cookie
+
+**Cookie 无效或权限不足**
+
+- 确保 Cookie 来源于已登录的账户
+- 检查账户是否有访问目标内容的权限
+- Cookie 可能需要包含必要的会话和认证信息
+
+**Cookie 频繁过期**
+
+- Cookie 有时间限制，需要定期更新
+- 可以设置自动化脚本定期获取新的 Cookie
+- 考虑在配置文件中更新 Cookie 而不是命令行参数
 
 ## 开发信息
 
