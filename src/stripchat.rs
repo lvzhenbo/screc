@@ -169,8 +169,32 @@ impl StripChatRecorder {
             status_cache_duration: std::time::Duration::from_secs(5), // 5秒缓存
         };
 
-        // 初始化静态数据
-        instance.initialize_static_data().await?;
+        // 初始化静态数据，带重试机制
+        let mut retry_count = 0;
+        const MAX_STATIC_RETRIES: u32 = 3;
+        
+        loop {
+            match instance.initialize_static_data().await {
+                Ok(()) => {
+                    debug!("[{}] 静态数据初始化成功", instance.config.username);
+                    break;
+                }
+                Err(e) if retry_count < MAX_STATIC_RETRIES && Self::is_retryable_error(&e) => {
+                    retry_count += 1;
+                    warn!("[{}] 静态数据初始化失败 (尝试 {}/{}): {}", 
+                          instance.config.username, retry_count, MAX_STATIC_RETRIES, e);
+                    
+                    // 指数退避: 2^retry_count 秒
+                    let delay = std::time::Duration::from_secs(2u64.pow(retry_count));
+                    debug!("[{}] 等待 {:?} 后重试静态数据初始化", instance.config.username, delay);
+                    tokio::time::sleep(delay).await;
+                }
+                Err(e) => {
+                    error!("[{}] 静态数据初始化最终失败: {}", instance.config.username, e);
+                    return Err(e);
+                }
+            }
+        }
 
         // 根据cookie来源处理初始化
         match instance.cookie_source {
@@ -196,15 +220,41 @@ impl StripChatRecorder {
     async fn initialize_static_data(&mut self) -> Result<()> {
         debug!("[{}] 正在初始化StripChat静态数据", self.config.username);
         
-        // 获取静态配置数据
-        let static_response = self.client
-            .get("https://hu.stripchat.com/api/front/v3/config/static")
-            .send()
-            .await?;
+        // 尝试多个API端点获取静态配置数据
+        let api_urls = [
+            "https://stripchat.com/api/front/v3/config/static",
+            "https://hu.stripchat.com/api/front/v3/config/static",
+            "https://www.stripchat.com/api/front/v3/config/static",
+        ];
+        
+        let mut last_error = None;
+        let mut static_response = None;
+        
+        for url in &api_urls {
+            debug!("[{}] 尝试从 {} 获取静态数据", self.config.username, url);
             
-        if !static_response.status().is_success() {
-            return Err(anyhow!("获取StripChat静态数据失败: {}", static_response.status()));
+            match self.client.get(*url).send().await {
+                Ok(response) if response.status().is_success() => {
+                    debug!("[{}] 成功从 {} 获取静态数据", self.config.username, url);
+                    static_response = Some(response);
+                    break;
+                }
+                Ok(response) => {
+                    let error = anyhow!("HTTP错误 {}: {}", response.status(), url);
+                    warn!("[{}] {}", self.config.username, error);
+                    last_error = Some(error);
+                }
+                Err(e) => {
+                    let error = anyhow!("网络错误: {} - {}", url, e);
+                    warn!("[{}] {}", self.config.username, error);
+                    last_error = Some(error);
+                }
+            }
         }
+        
+        let static_response = static_response.ok_or_else(|| {
+            last_error.unwrap_or_else(|| anyhow!("无法从任何端点获取StripChat静态数据"))
+        })?;
         
         let static_data: StaticData = static_response.json().await?;
         let static_config = static_data.static_config;
@@ -285,7 +335,9 @@ impl StripChatRecorder {
         error_str.contains("temporarily") ||
         error_str.contains("503") ||
         error_str.contains("502") ||
-        error_str.contains("500")
+        error_str.contains("500") ||
+        error_str.contains("network") ||
+        error_str.contains("dns")
     }
 
     /// 动态提取MOUFLON解密密钥
