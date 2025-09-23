@@ -2,12 +2,14 @@ use anyhow::{Result, anyhow};
 use base64::{Engine as _, engine::general_purpose};
 use chrono::Utc;
 use log::{debug, error, info, warn};
+use regex::Regex;
 use reqwest::{
     Client,
     cookie::{CookieStore, Jar},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, broadcast};
@@ -61,6 +63,37 @@ struct PlaylistVariant {
     resolution: (u32, u32), // 分辨率 (宽度, 高度)
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct StaticConfig {
+    features: Features,
+    #[serde(rename = "featuresV2")]
+    features_v2: FeaturesV2,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct Features {
+    #[serde(rename = "MMPExternalSourceOrigin")]
+    mmp_external_source_origin: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct FeaturesV2 {
+    #[serde(rename = "playerModuleExternalLoading")]
+    player_module_external_loading: PlayerModuleExternalLoading,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PlayerModuleExternalLoading {
+    #[serde(rename = "mmpVersion")]
+    mmp_version: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct StaticData {
+    #[serde(rename = "static")]
+    static_config: StaticConfig,
+}
+
 pub struct StripChatRecorder {
     config: Config,                               // 配置
     app_config: Arc<Mutex<AppConfig>>,            // 全局配置
@@ -73,6 +106,10 @@ pub struct StripChatRecorder {
     pkey: Option<String>,                         // PKEY参数
     status: StreamStatus,                         // 流状态
     shutdown_rx: Option<broadcast::Receiver<()>>, // 关闭信号接收器
+    static_data: Option<StaticConfig>,            // StripChat静态配置数据
+    mouflon_keys: std::collections::HashMap<String, String>, // MOUFLON密钥缓存
+    main_js_content: Option<String>,              // main.js内容缓存
+    doppio_js_content: Option<String>,            // doppio.js内容缓存
 }
 
 impl StripChatRecorder {
@@ -102,7 +139,7 @@ impl StripChatRecorder {
             config.cookies.as_deref(),
         )?;
 
-        let instance = Self {
+        let mut instance = Self {
             config,
             app_config: app_config.clone(),
             config_file_path,
@@ -114,7 +151,14 @@ impl StripChatRecorder {
             pkey: None,
             status: StreamStatus::Unknown,
             shutdown_rx: None,
+            static_data: None,
+            mouflon_keys: std::collections::HashMap::new(),
+            main_js_content: None,
+            doppio_js_content: None,
         };
+
+        // 初始化静态数据
+        instance.initialize_static_data().await?;
 
         // 根据cookie来源处理初始化
         match instance.cookie_source {
@@ -134,6 +178,115 @@ impl StripChatRecorder {
         }
 
         Ok(instance)
+    }
+
+    /// 初始化StripChat静态数据
+    async fn initialize_static_data(&mut self) -> Result<()> {
+        debug!("[{}] 正在初始化StripChat静态数据", self.config.username);
+        
+        // 获取静态配置数据
+        let static_response = self.client
+            .get("https://hu.stripchat.com/api/front/v3/config/static")
+            .send()
+            .await?;
+            
+        if !static_response.status().is_success() {
+            return Err(anyhow!("获取StripChat静态数据失败: {}", static_response.status()));
+        }
+        
+        let static_data: StaticData = static_response.json().await?;
+        let static_config = static_data.static_config;
+        
+        debug!("[{}] 获取到MMP配置: origin={}, version={}", 
+               self.config.username,
+               static_config.features.mmp_external_source_origin,
+               static_config.features_v2.player_module_external_loading.mmp_version);
+        
+        // 获取main.js
+        let mmp_base = format!("{}/v{}", 
+                              static_config.features.mmp_external_source_origin,
+                              static_config.features_v2.player_module_external_loading.mmp_version);
+        
+        let main_js_url = format!("{}/main.js", mmp_base);
+        let main_js_response = self.client.get(&main_js_url).send().await?;
+        
+        if !main_js_response.status().is_success() {
+            return Err(anyhow!("获取main.js失败: {}", main_js_response.status()));
+        }
+        
+        let main_js_content = main_js_response.text().await?;
+        
+        // 从main.js中提取doppio.js文件名
+        if let Some(captures) = Regex::new(r#"require\("\./([^"]*Doppio[^"]*\.js)"\)"#)
+            .unwrap()
+            .captures(&main_js_content) {
+            
+            let doppio_js_name = &captures[1];
+            let doppio_js_url = format!("{}/{}", mmp_base, doppio_js_name);
+            
+            debug!("[{}] 正在获取doppio.js: {}", self.config.username, doppio_js_url);
+            
+            let doppio_js_response = self.client.get(&doppio_js_url).send().await?;
+            if !doppio_js_response.status().is_success() {
+                return Err(anyhow!("获取doppio.js失败: {}", doppio_js_response.status()));
+            }
+            
+            let doppio_js_content = doppio_js_response.text().await?;
+            
+            // 缓存内容
+            self.static_data = Some(static_config);
+            self.main_js_content = Some(main_js_content);
+            self.doppio_js_content = Some(doppio_js_content);
+            
+            debug!("[{}] 静态数据初始化完成", self.config.username);
+        } else {
+            return Err(anyhow!("无法从main.js中提取doppio.js文件名"));
+        }
+        
+        Ok(())
+    }
+
+    /// 生成随机uniq参数
+    fn generate_uniq() -> String {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let chars: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+        (0..16)
+            .map(|_| {
+                let idx = rng.gen_range(0..chars.len());
+                chars[idx] as char
+            })
+            .collect()
+    }
+
+    /// 动态提取MOUFLON解密密钥
+    fn get_mouflon_decryption_key(&mut self, pkey: &str) -> Result<String> {
+        // 从缓存中查找
+        if let Some(cached_key) = self.mouflon_keys.get(pkey) {
+            return Ok(cached_key.clone());
+        }
+
+        // 如果没有doppio.js内容，返回错误
+        let doppio_js_content = self.doppio_js_content
+            .as_ref()
+            .ok_or_else(|| anyhow!("doppio.js内容未初始化"))?;
+
+        // 从doppio.js中提取密钥
+        let pattern = format!(r#""{}:(.*?)""#, regex::escape(pkey));
+        if let Some(captures) = Regex::new(&pattern).unwrap().captures(doppio_js_content) {
+            let key = captures[1].to_string();
+            debug!("[{}] 为pkey {} 提取到MOUFLON密钥", self.config.username, pkey);
+            
+            // 缓存密钥
+            self.mouflon_keys.insert(pkey.to_string(), key.clone());
+            Ok(key)
+        } else {
+            // 如果动态提取失败，回退到硬编码密钥
+            warn!("[{}] 无法为pkey {} 动态提取MOUFLON密钥，使用默认密钥", self.config.username, pkey);
+            let fallback_key = "Quean4cai9boJa5a".to_string();
+            self.mouflon_keys.insert(pkey.to_string(), fallback_key.clone());
+            Ok(fallback_key)
+        }
     }
 
     /// 设置关闭信号接收器
@@ -457,9 +610,10 @@ impl StripChatRecorder {
         &mut self,
         previous_status: &mut StreamStatus,
     ) -> Result<StreamStatus> {
+        let uniq = Self::generate_uniq();
         let url = format!(
-            "https://stripchat.com/api/vr/v2/models/username/{}",
-            self.config.username
+            "https://stripchat.com/api/front/v2/models/username/{}/cam?uniq={}",
+            self.config.username, uniq
         );
         debug!("[{}] 检查状态: {}", self.config.username, url);
 
@@ -570,7 +724,9 @@ impl StripChatRecorder {
         }
 
         let username = self.config.username.clone();
-        let processor = move |content: &str| Self::m3u_decoder(content, &username);
+        let mouflon_keys = self.mouflon_keys.clone();
+        let doppio_js_content = self.doppio_js_content.clone();
+        let processor = move |content: &str| Self::m3u_decoder_with_dynamic_keys(content, &username, &mouflon_keys, &doppio_js_content);
         downloader
             .download_hls_stream(&video_url, &output_path, Some(&processor))
             .await?;
@@ -606,9 +762,16 @@ impl StripChatRecorder {
         };
 
         let stream_name = &cam.stream_name;
+        
+        // 随机选择CDN主机 (模仿参考实现)
+        use rand::seq::SliceRandom;
+        let cdn_hosts = ["doppiocdn.org", "doppiocdn.com", "doppiocdn.net"];
+        let selected_host = cdn_hosts.choose(&mut rand::thread_rng())
+            .unwrap_or(&"doppiocdn.com");
+            
         let master_url = format!(
-            "https://edge-hls.doppiocdn.com/hls/{}/master/{}_auto.m3u8",
-            stream_name, stream_name
+            "https://edge-hls.{}/hls/{}/master/{}_auto.m3u8",
+            selected_host, stream_name, stream_name
         );
 
         debug!("[{}] 获取主播放列表: {}", self.config.username, master_url);
@@ -750,22 +913,59 @@ impl StripChatRecorder {
         path
     }
 
-    // M3U8 解密函数
-    fn m3u_decoder(content: &str, username: &str) -> String {
+    // M3U8 解密函数 - 使用动态密钥提取
+    fn m3u_decoder_with_dynamic_keys(
+        content: &str, 
+        username: &str, 
+        mouflon_keys: &HashMap<String, String>,
+        doppio_js_content: &Option<String>
+    ) -> String {
+        debug!("[{}] M3U8 解码器开始处理", username);
+        
+        // 首先提取MOUFLON参数
+        let (psch, pkey) = Self::extract_mouflon_from_m3u(content);
+        let pkey = match pkey {
+            Some(key) => key,
+            None => {
+                debug!("[{}] 未发现MOUFLON参数，返回原始内容", username);
+                return content.to_string();
+            }
+        };
+
+        // 获取解密密钥
+        let decryption_key = mouflon_keys.get(&pkey)
+            .cloned()
+            .or_else(|| {
+                // 尝试从doppio.js动态提取
+                if let Some(js_content) = doppio_js_content {
+                    let pattern = format!(r#""{}:(.*?)""#, regex::escape(&pkey));
+                    if let Some(captures) = Regex::new(&pattern).unwrap().captures(js_content) {
+                        debug!("[{}] 为pkey {} 动态提取到MOUFLON密钥", username, pkey);
+                        Some(captures[1].to_string())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| {
+                warn!("[{}] 无法获取MOUFLON密钥，使用默认密钥", username);
+                "Quean4cai9boJa5a".to_string()
+            });
+
         let mut decoded = Vec::new();
         let lines: Vec<&str> = content.lines().collect();
         let mut i = 0;
-
-        debug!("[{}] M3U8 解码器开始处理 {} 行", username, lines.len());
 
         while i < lines.len() {
             let line = lines[i];
 
             if line.starts_with("#EXT-X-MOUFLON:FILE:") {
                 let encrypted_data = &line[20..];
-                debug!("[{}] 在索引 {} 发现 MOUFLON FILE 行: {}", username, i, line);
+                debug!("[{}] 在索引 {} 发现 MOUFLON FILE 行", username, i);
 
-                match Self::decode_mouflon(encrypted_data, "Quean4cai9boJa5a") {
+                match Self::decode_mouflon(encrypted_data, &decryption_key) {
                     Ok(decrypted) => {
                         debug!("[{}] 解密成功: {}", username, decrypted);
 
@@ -773,8 +973,6 @@ impl StripChatRecorder {
                         if i + 1 < lines.len() {
                             let original_line = lines[i + 1];
                             let next_line = original_line.replace("media.mp4", &decrypted);
-                            debug!("[{}] 原始下一行: {}", username, original_line);
-                            debug!("[{}] 转换后的下一行: {}", username, next_line);
                             decoded.push(next_line);
                             i += 2; // Skip both current line and next line
                             continue;
@@ -790,8 +988,24 @@ impl StripChatRecorder {
             i += 1;
         }
 
-        debug!("[{}] M3U8 解码器完成处理 {} 行", username, decoded.len());
+        debug!("[{}] M3U8 解码器完成处理", username);
         decoded.join("\n")
+    }
+
+    /// 提取MOUFLON参数
+    fn extract_mouflon_from_m3u(content: &str) -> (Option<String>, Option<String>) {
+        if let Some(line) = content.lines().find(|line| line.contains("#EXT-X-MOUFLON:")) {
+            let parts: Vec<&str> = line.split(':').collect();
+            if parts.len() >= 4 {
+                return (Some(parts[2].to_string()), Some(parts[3].to_string()));
+            }
+        }
+        (None, None)
+    }
+
+    // 保留旧的M3U8解密函数以向后兼容
+    fn m3u_decoder(content: &str, username: &str) -> String {
+        Self::m3u_decoder_with_dynamic_keys(content, username, &HashMap::new(), &None)
     }
 
     /// 解码 MOUFLON 加密数据

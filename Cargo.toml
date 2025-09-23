@@ -26,6 +26,8 @@ log = "0.4.28"
 fern = "0.7.1"
 colored = "3.0.0"
 clap = { version = "4.5.47", features = ["derive"] }
+regex = "1.10.2"
+rand = "0.8"
 
 # 二进制大小优化配置
 [profile.release]
