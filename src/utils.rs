@@ -83,7 +83,13 @@ pub fn create_client(
 
     let mut client_builder = Client::builder()
         .cookie_provider(jar.clone())
-        .user_agent(user_agent);
+        .user_agent(user_agent)
+        .timeout(std::time::Duration::from_secs(30))  // 30秒超时
+        .connect_timeout(std::time::Duration::from_secs(10))  // 10秒连接超时
+        .tcp_keepalive(std::time::Duration::from_secs(30))  // TCP keepalive
+        .pool_idle_timeout(std::time::Duration::from_secs(90))  // 连接池空闲超时
+        .pool_max_idle_per_host(4)  // 每个主机最大空闲连接数
+        .http2_prior_knowledge();  // 优先使用HTTP/2
 
     // 如果提供了代理，则配置代理
     if let Some(proxy_url) = proxy_url {
