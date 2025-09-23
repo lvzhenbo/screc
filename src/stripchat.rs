@@ -261,11 +261,11 @@ impl StripChatRecorder {
     /// 生成随机uniq参数
     fn generate_uniq() -> String {
         use rand::Rng;
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let chars: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
         (0..16)
             .map(|_| {
-                let idx = rng.gen_range(0..chars.len());
+                let idx = rng.random_range(0..chars.len());
                 chars[idx] as char
             })
             .collect()
@@ -862,9 +862,9 @@ impl StripChatRecorder {
         let stream_name = &cam.stream_name;
         
         // 随机选择CDN主机 (模仿参考实现)
-        use rand::seq::SliceRandom;
+        use rand::prelude::IndexedRandom;
         let cdn_hosts = ["doppiocdn.org", "doppiocdn.com", "doppiocdn.net"];
-        let selected_host = cdn_hosts.choose(&mut rand::thread_rng())
+        let selected_host = cdn_hosts.choose(&mut rand::rng())
             .unwrap_or(&"doppiocdn.com");
             
         let master_url = format!(
