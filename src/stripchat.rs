@@ -41,10 +41,8 @@ struct ApiResponse {
     #[serde(rename = "user")]
     user: Option<UserInfo>, // 用户信息 (新API格式)
     model: Option<ModelInfo>, // 模特信息 (兼容旧格式)
-    #[serde(rename = "isCamAvailable")]
-    is_cam_available: Option<bool>, // 摄像头是否可用
-    cam: Option<CamInfo>, // 摄像头信息
-    error: Option<String>, // 错误信息
+    cam: Option<CamInfo>,     // 摄像头信息
+    error: Option<String>,    // 错误信息
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -59,6 +57,8 @@ struct ModelInfo {
 
 #[derive(Debug, Clone, Deserialize)]
 struct CamInfo {
+    #[serde(rename = "isCamAvailable")]
+    is_cam_available: bool, // 摄像头是否可用
     #[serde(rename = "isCamActive")]
     is_cam_active: bool, // 摄像头是否激活
     #[serde(rename = "streamName")]
@@ -103,23 +103,23 @@ struct StaticData {
 }
 
 pub struct StripChatRecorder {
-    config: Config,                               // 配置
-    app_config: Arc<Mutex<AppConfig>>,            // 全局配置
-    config_file_path: Option<PathBuf>,            // 配置文件路径
-    cookie_source: CookieSource,                  // Cookie来源
-    cookie_jar: Arc<Jar>,                         // Cookie存储
-    client: Client,                               // HTTP客户端
-    last_info: Option<ApiResponse>,               // 最后一次API响应
-    psch: Option<String>,                         // PSCH参数
-    pkey: Option<String>,                         // PKEY参数
-    status: StreamStatus,                         // 流状态
-    shutdown_rx: Option<broadcast::Receiver<()>>, // 关闭信号接收器
-    static_data: Option<StaticConfig>,            // StripChat静态配置数据
+    config: Config,                                          // 配置
+    app_config: Arc<Mutex<AppConfig>>,                       // 全局配置
+    config_file_path: Option<PathBuf>,                       // 配置文件路径
+    cookie_source: CookieSource,                             // Cookie来源
+    cookie_jar: Arc<Jar>,                                    // Cookie存储
+    client: Client,                                          // HTTP客户端
+    last_info: Option<ApiResponse>,                          // 最后一次API响应
+    psch: Option<String>,                                    // PSCH参数
+    pkey: Option<String>,                                    // PKEY参数
+    status: StreamStatus,                                    // 流状态
+    shutdown_rx: Option<broadcast::Receiver<()>>,            // 关闭信号接收器
+    static_data: Option<StaticConfig>,                       // StripChat静态配置数据
     mouflon_keys: std::collections::HashMap<String, String>, // MOUFLON密钥缓存
-    main_js_content: Option<String>,              // main.js内容缓存
-    doppio_js_content: Option<String>,            // doppio.js内容缓存
-    last_status_check: Option<std::time::Instant>, // 上次状态检查时间
-    status_cache_duration: std::time::Duration,   // 状态缓存持续时间
+    main_js_content: Option<String>,                         // main.js内容缓存
+    doppio_js_content: Option<String>,                       // doppio.js内容缓存
+    last_status_check: Option<std::time::Instant>,           // 上次状态检查时间
+    status_cache_duration: std::time::Duration,              // 状态缓存持续时间
 }
 
 impl StripChatRecorder {
@@ -195,66 +195,86 @@ impl StripChatRecorder {
     /// 初始化StripChat静态数据
     async fn initialize_static_data(&mut self) -> Result<()> {
         debug!("[{}] 正在初始化StripChat静态数据", self.config.username);
-        
+
         // 获取静态配置数据
-        let static_response = self.client
+        let static_response = self
+            .client
             .get("https://hu.stripchat.com/api/front/v3/config/static")
             .send()
             .await?;
-            
+
         if !static_response.status().is_success() {
-            return Err(anyhow!("获取StripChat静态数据失败: {}", static_response.status()));
+            return Err(anyhow!(
+                "获取StripChat静态数据失败: {}",
+                static_response.status()
+            ));
         }
-        
+
         let static_data: StaticData = static_response.json().await?;
         let static_config = static_data.static_config;
-        
-        debug!("[{}] 获取到MMP配置: origin={}, version={}", 
-               self.config.username,
-               static_config.features.mmp_external_source_origin,
-               static_config.features_v2.player_module_external_loading.mmp_version);
-        
+
+        debug!(
+            "[{}] 获取到MMP配置: origin={}, version={}",
+            self.config.username,
+            static_config.features.mmp_external_source_origin,
+            static_config
+                .features_v2
+                .player_module_external_loading
+                .mmp_version
+        );
+
         // 获取main.js
-        let mmp_base = format!("{}/v{}", 
-                              static_config.features.mmp_external_source_origin,
-                              static_config.features_v2.player_module_external_loading.mmp_version);
-        
+        let mmp_base = format!(
+            "{}/v{}",
+            static_config.features.mmp_external_source_origin,
+            static_config
+                .features_v2
+                .player_module_external_loading
+                .mmp_version
+        );
+
         let main_js_url = format!("{}/main.js", mmp_base);
         let main_js_response = self.client.get(&main_js_url).send().await?;
-        
+
         if !main_js_response.status().is_success() {
             return Err(anyhow!("获取main.js失败: {}", main_js_response.status()));
         }
-        
+
         let main_js_content = main_js_response.text().await?;
-        
+
         // 从main.js中提取doppio.js文件名
         if let Some(captures) = Regex::new(r#"require\("\./([^"]*Doppio[^"]*\.js)"\)"#)
             .unwrap()
-            .captures(&main_js_content) {
-            
+            .captures(&main_js_content)
+        {
             let doppio_js_name = &captures[1];
             let doppio_js_url = format!("{}/{}", mmp_base, doppio_js_name);
-            
-            debug!("[{}] 正在获取doppio.js: {}", self.config.username, doppio_js_url);
-            
+
+            debug!(
+                "[{}] 正在获取doppio.js: {}",
+                self.config.username, doppio_js_url
+            );
+
             let doppio_js_response = self.client.get(&doppio_js_url).send().await?;
             if !doppio_js_response.status().is_success() {
-                return Err(anyhow!("获取doppio.js失败: {}", doppio_js_response.status()));
+                return Err(anyhow!(
+                    "获取doppio.js失败: {}",
+                    doppio_js_response.status()
+                ));
             }
-            
+
             let doppio_js_content = doppio_js_response.text().await?;
-            
+
             // 缓存内容
             self.static_data = Some(static_config);
             self.main_js_content = Some(main_js_content);
             self.doppio_js_content = Some(doppio_js_content);
-            
+
             debug!("[{}] 静态数据初始化完成", self.config.username);
         } else {
             return Err(anyhow!("无法从main.js中提取doppio.js文件名"));
         }
-        
+
         Ok(())
     }
 
@@ -275,17 +295,19 @@ impl StripChatRecorder {
     fn is_retryable_error(error: &anyhow::Error) -> bool {
         if let Some(reqwest_error) = error.downcast_ref::<reqwest::Error>() {
             // 网络错误通常可重试
-            return reqwest_error.is_connect() || reqwest_error.is_timeout() || reqwest_error.is_request();
+            return reqwest_error.is_connect()
+                || reqwest_error.is_timeout()
+                || reqwest_error.is_request();
         }
-        
+
         // 检查是否为暂时性HTTP错误
         let error_str = error.to_string().to_lowercase();
-        error_str.contains("timeout") || 
-        error_str.contains("connection") ||
-        error_str.contains("temporarily") ||
-        error_str.contains("503") ||
-        error_str.contains("502") ||
-        error_str.contains("500")
+        error_str.contains("timeout")
+            || error_str.contains("connection")
+            || error_str.contains("temporarily")
+            || error_str.contains("503")
+            || error_str.contains("502")
+            || error_str.contains("500")
     }
 
     /// 动态提取MOUFLON解密密钥
@@ -296,7 +318,8 @@ impl StripChatRecorder {
         }
 
         // 如果没有doppio.js内容，返回错误
-        let doppio_js_content = self.doppio_js_content
+        let doppio_js_content = self
+            .doppio_js_content
             .as_ref()
             .ok_or_else(|| anyhow!("doppio.js内容未初始化"))?;
 
@@ -304,16 +327,23 @@ impl StripChatRecorder {
         let pattern = format!(r#""{}:(.*?)""#, regex::escape(pkey));
         if let Some(captures) = Regex::new(&pattern).unwrap().captures(doppio_js_content) {
             let key = captures[1].to_string();
-            debug!("[{}] 为pkey {} 提取到MOUFLON密钥", self.config.username, pkey);
-            
+            debug!(
+                "[{}] 为pkey {} 提取到MOUFLON密钥",
+                self.config.username, pkey
+            );
+
             // 缓存密钥
             self.mouflon_keys.insert(pkey.to_string(), key.clone());
             Ok(key)
         } else {
             // 如果动态提取失败，回退到硬编码密钥
-            warn!("[{}] 无法为pkey {} 动态提取MOUFLON密钥，使用默认密钥", self.config.username, pkey);
+            warn!(
+                "[{}] 无法为pkey {} 动态提取MOUFLON密钥，使用默认密钥",
+                self.config.username, pkey
+            );
             let fallback_key = "Quean4cai9boJa5a".to_string();
-            self.mouflon_keys.insert(pkey.to_string(), fallback_key.clone());
+            self.mouflon_keys
+                .insert(pkey.to_string(), fallback_key.clone());
             Ok(fallback_key)
         }
     }
@@ -641,15 +671,17 @@ impl StripChatRecorder {
     ) -> Result<StreamStatus> {
         let mut retry_count = 0;
         const MAX_RETRIES: u32 = 3;
-        
+
         loop {
             match self.check_status_internal(previous_status).await {
                 Ok(status) => return Ok(status),
                 Err(e) if retry_count < MAX_RETRIES && Self::is_retryable_error(&e) => {
                     retry_count += 1;
-                    warn!("[{}] 状态检查失败 (尝试 {}/{}): {}", 
-                          self.config.username, retry_count, MAX_RETRIES, e);
-                    
+                    warn!(
+                        "[{}] 状态检查失败 (尝试 {}/{}): {}",
+                        self.config.username, retry_count, MAX_RETRIES, e
+                    );
+
                     // 指数退避: 2^retry_count 秒
                     let delay = std::time::Duration::from_secs(2u64.pow(retry_count));
                     if self.interruptible_sleep(delay).await {
@@ -658,8 +690,12 @@ impl StripChatRecorder {
                 }
                 Err(e) => {
                     if retry_count > 0 {
-                        error!("[{}] 状态检查最终失败 (尝试了 {} 次): {}", 
-                               self.config.username, retry_count + 1, e);
+                        error!(
+                            "[{}] 状态检查最终失败 (尝试了 {} 次): {}",
+                            self.config.username,
+                            retry_count + 1,
+                            e
+                        );
                     }
                     return Err(e);
                 }
@@ -705,17 +741,24 @@ impl StripChatRecorder {
             }
             status if !status.is_success() => {
                 // 检查是否为认证相关错误
-                if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-                    warn!("[{}] 检测到认证错误 (HTTP {}), 尝试刷新cookies", self.config.username, status);
-                    
+                if status == reqwest::StatusCode::UNAUTHORIZED
+                    || status == reqwest::StatusCode::FORBIDDEN
+                {
+                    warn!(
+                        "[{}] 检测到认证错误 (HTTP {}), 尝试刷新cookies",
+                        self.config.username, status
+                    );
+
                     // 尝试刷新cookies
-                    if let Err(e) = Self::refresh_cookies_only(&self.client, &self.config.username).await {
+                    if let Err(e) =
+                        Self::refresh_cookies_only(&self.client, &self.config.username).await
+                    {
                         debug!("[{}] Cookie刷新失败: {}", self.config.username, e);
                     }
-                    
+
                     return Err(anyhow!("认证失败，已尝试刷新cookies: HTTP {}", status));
                 }
-                
+
                 let error_status = StreamStatus::Error;
                 error!("[{}] 状态: 错误 (HTTP {})", self.config.username, status);
                 // 只在状态变化时更新 previous_status
@@ -736,9 +779,16 @@ impl StripChatRecorder {
                 "Not Found" => StreamStatus::Offline,
                 _ => StreamStatus::Error,
             };
-            info!("[{}] 状态: {} ({})", self.config.username, 
-                  if matches!(error_status, StreamStatus::Offline) { "离线" } else { "错误" }, 
-                  error);
+            info!(
+                "[{}] 状态: {} ({})",
+                self.config.username,
+                if matches!(error_status, StreamStatus::Offline) {
+                    "离线"
+                } else {
+                    "错误"
+                },
+                error
+            );
             if std::mem::discriminant(&error_status) != std::mem::discriminant(previous_status) {
                 *previous_status = error_status.clone();
             }
@@ -746,14 +796,19 @@ impl StripChatRecorder {
         }
 
         // 获取模型信息，优先使用新格式
-        let model_info = api_response.user
+        let model_info = api_response
+            .user
             .as_ref()
             .map(|u| &u.user)
             .or(api_response.model.as_ref())
             .ok_or_else(|| anyhow!("API响应中缺少用户/模型信息"))?;
 
-        let is_cam_available = api_response.is_cam_available.unwrap_or(false);
-        
+        let is_cam_available = api_response
+            .cam
+            .as_ref()
+            .map(|c| c.is_cam_available)
+            .unwrap_or(false);
+
         let status = match model_info.status.as_str() {
             "public" if is_cam_available => {
                 let final_status = api_response
@@ -824,7 +879,14 @@ impl StripChatRecorder {
         let username = self.config.username.clone();
         let mouflon_keys = self.mouflon_keys.clone();
         let doppio_js_content = self.doppio_js_content.clone();
-        let processor = move |content: &str| Self::m3u_decoder_with_dynamic_keys(content, &username, &mouflon_keys, &doppio_js_content);
+        let processor = move |content: &str| {
+            Self::m3u_decoder_with_dynamic_keys(
+                content,
+                &username,
+                &mouflon_keys,
+                &doppio_js_content,
+            )
+        };
         downloader
             .download_hls_stream(&video_url, &output_path, Some(&processor))
             .await?;
@@ -860,13 +922,14 @@ impl StripChatRecorder {
         };
 
         let stream_name = &cam.stream_name;
-        
+
         // 随机选择CDN主机 (模仿参考实现)
         use rand::prelude::IndexedRandom;
         let cdn_hosts = ["doppiocdn.org", "doppiocdn.com", "doppiocdn.net"];
-        let selected_host = cdn_hosts.choose(&mut rand::rng())
+        let selected_host = cdn_hosts
+            .choose(&mut rand::rng())
             .unwrap_or(&"doppiocdn.com");
-            
+
         let master_url = format!(
             "https://edge-hls.{}/hls/{}/master/{}_auto.m3u8",
             selected_host, stream_name, stream_name
@@ -1013,13 +1076,13 @@ impl StripChatRecorder {
 
     // M3U8 解密函数 - 使用动态密钥提取
     fn m3u_decoder_with_dynamic_keys(
-        content: &str, 
-        username: &str, 
+        content: &str,
+        username: &str,
         mouflon_keys: &HashMap<String, String>,
-        doppio_js_content: &Option<String>
+        doppio_js_content: &Option<String>,
     ) -> String {
         debug!("[{}] M3U8 解码器开始处理", username);
-        
+
         // 首先提取MOUFLON参数
         let (_psch, pkey) = Self::extract_mouflon_from_m3u(content);
         let pkey = match pkey {
@@ -1031,7 +1094,8 @@ impl StripChatRecorder {
         };
 
         // 获取解密密钥
-        let decryption_key = mouflon_keys.get(&pkey)
+        let decryption_key = mouflon_keys
+            .get(&pkey)
             .cloned()
             .or_else(|| {
                 // 尝试从doppio.js动态提取
@@ -1092,7 +1156,10 @@ impl StripChatRecorder {
 
     /// 提取MOUFLON参数
     fn extract_mouflon_from_m3u(content: &str) -> (Option<String>, Option<String>) {
-        if let Some(line) = content.lines().find(|line| line.contains("#EXT-X-MOUFLON:")) {
+        if let Some(line) = content
+            .lines()
+            .find(|line| line.contains("#EXT-X-MOUFLON:"))
+        {
             let parts: Vec<&str> = line.split(':').collect();
             if parts.len() >= 4 {
                 return (Some(parts[2].to_string()), Some(parts[3].to_string()));
