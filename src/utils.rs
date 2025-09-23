@@ -4,6 +4,10 @@ use std::env;
 use std::sync::Arc;
 use url::Url;
 
+// 重新导出 reqwest 类型以便统一管理
+// 这样可以避免在其他模块中直接导入 reqwest，保持统一的客户端管理
+pub use reqwest::{StatusCode, Error as ReqwestError};
+
 /// 代理配置结构体
 #[derive(Debug, Clone)]
 pub struct ProxyConfig {

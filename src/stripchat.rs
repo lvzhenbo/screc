@@ -17,7 +17,9 @@ use url::Url;
 
 use crate::config::{AppConfig, Config};
 use crate::downloader::HlsDownloader;
-use crate::utils::create_client;
+// 使用统一的客户端创建函数和 reqwest 类型导入
+// 避免直接使用 reqwest::* 以保持代码的一致性和可维护性
+use crate::utils::{create_client, StatusCode, ReqwestError};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StreamStatus {
@@ -273,7 +275,7 @@ impl StripChatRecorder {
 
     /// 检查错误是否可重试
     fn is_retryable_error(error: &anyhow::Error) -> bool {
-        if let Some(reqwest_error) = error.downcast_ref::<reqwest::Error>() {
+        if let Some(reqwest_error) = error.downcast_ref::<ReqwestError>() {
             // 网络错误通常可重试
             return reqwest_error.is_connect() || reqwest_error.is_timeout() || reqwest_error.is_request();
         }
@@ -694,7 +696,7 @@ impl StripChatRecorder {
         };
 
         let api_response: ApiResponse = match response.status() {
-            reqwest::StatusCode::NOT_FOUND => {
+            StatusCode::NOT_FOUND => {
                 let status = StreamStatus::Offline;
                 info!("[{}] 状态: 离线 (用户不存在)", self.config.username);
                 // 只在状态变化时更新 previous_status
@@ -705,7 +707,7 @@ impl StripChatRecorder {
             }
             status if !status.is_success() => {
                 // 检查是否为认证相关错误
-                if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+                if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
                     warn!("[{}] 检测到认证错误 (HTTP {}), 尝试刷新cookies", self.config.username, status);
                     
                     // 尝试刷新cookies

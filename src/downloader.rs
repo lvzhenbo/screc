@@ -8,6 +8,9 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast;
 use url::Url;
 
+// 使用统一的 reqwest 类型导入避免直接使用 reqwest::StatusCode
+use crate::utils::StatusCode;
+
 pub struct HlsDownloader {
     client: Client,                               // HTTP客户端
     downloaded_segments: HashSet<String>,         // 已下载的分片集合
@@ -461,10 +464,10 @@ impl HlsDownloader {
 
         // 处理特定的 HTTP 状态码
         match response.status() {
-            reqwest::StatusCode::OK => {
+            StatusCode::OK => {
                 // 成功，继续下载
             }
-            reqwest::StatusCode::IM_A_TEAPOT => {
+            StatusCode::IM_A_TEAPOT => {
                 // "I'm a teapot" - CDN 经常使用这个状态码表示
                 // 分片尚未准备好或暂时不可用
                 debug!(
@@ -473,7 +476,7 @@ impl HlsDownloader {
                 );
                 return Ok(()); // 跳过此分片，不作为错误处理
             }
-            reqwest::StatusCode::NOT_FOUND => {
+            StatusCode::NOT_FOUND => {
                 // 分片未找到，可能已过期或尚不可用
                 debug!(
                     "[{}] 分片 {} 未找到 (404)，跳过",
@@ -481,7 +484,7 @@ impl HlsDownloader {
                 );
                 return Ok(());
             }
-            reqwest::StatusCode::FORBIDDEN => {
+            StatusCode::FORBIDDEN => {
                 // 禁止访问，可能由于频率限制或访问限制
                 debug!(
                     "[{}] 分片 {} 被禁止访问 (403)，跳过",
@@ -489,7 +492,7 @@ impl HlsDownloader {
                 );
                 return Ok(());
             }
-            reqwest::StatusCode::TOO_MANY_REQUESTS => {
+            StatusCode::TOO_MANY_REQUESTS => {
                 // 请求过多 - 应该延迟后重试
                 return Err(anyhow!("请求过于频繁 (429)，将重试"));
             }
