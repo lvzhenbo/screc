@@ -38,10 +38,18 @@ enum CookieSource {
 
 #[derive(Debug, Clone, Deserialize)]
 struct ApiResponse {
-    model: ModelInfo, // 模特信息
+    #[serde(rename = "user")]
+    user: Option<UserInfo>, // 用户信息 (新API格式)
+    model: Option<ModelInfo>, // 模特信息 (兼容旧格式)
     #[serde(rename = "isCamAvailable")]
-    is_cam_available: bool, // 摄像头是否可用
+    is_cam_available: Option<bool>, // 摄像头是否可用
     cam: Option<CamInfo>, // 摄像头信息
+    error: Option<String>, // 错误信息
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct UserInfo {
+    user: ModelInfo, // 嵌套的用户信息
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -110,6 +118,8 @@ pub struct StripChatRecorder {
     mouflon_keys: std::collections::HashMap<String, String>, // MOUFLON密钥缓存
     main_js_content: Option<String>,              // main.js内容缓存
     doppio_js_content: Option<String>,            // doppio.js内容缓存
+    last_status_check: Option<std::time::Instant>, // 上次状态检查时间
+    status_cache_duration: std::time::Duration,   // 状态缓存持续时间
 }
 
 impl StripChatRecorder {
@@ -155,6 +165,8 @@ impl StripChatRecorder {
             mouflon_keys: std::collections::HashMap::new(),
             main_js_content: None,
             doppio_js_content: None,
+            last_status_check: None,
+            status_cache_duration: std::time::Duration::from_secs(5), // 5秒缓存
         };
 
         // 初始化静态数据
@@ -257,6 +269,23 @@ impl StripChatRecorder {
                 chars[idx] as char
             })
             .collect()
+    }
+
+    /// 检查错误是否可重试
+    fn is_retryable_error(error: &anyhow::Error) -> bool {
+        if let Some(reqwest_error) = error.downcast_ref::<reqwest::Error>() {
+            // 网络错误通常可重试
+            return reqwest_error.is_connect() || reqwest_error.is_timeout() || reqwest_error.is_request();
+        }
+        
+        // 检查是否为暂时性HTTP错误
+        let error_str = error.to_string().to_lowercase();
+        error_str.contains("timeout") || 
+        error_str.contains("connection") ||
+        error_str.contains("temporarily") ||
+        error_str.contains("503") ||
+        error_str.contains("502") ||
+        error_str.contains("500")
     }
 
     /// 动态提取MOUFLON解密密钥
@@ -610,6 +639,39 @@ impl StripChatRecorder {
         &mut self,
         previous_status: &mut StreamStatus,
     ) -> Result<StreamStatus> {
+        let mut retry_count = 0;
+        const MAX_RETRIES: u32 = 3;
+        
+        loop {
+            match self.check_status_internal(previous_status).await {
+                Ok(status) => return Ok(status),
+                Err(e) if retry_count < MAX_RETRIES && Self::is_retryable_error(&e) => {
+                    retry_count += 1;
+                    warn!("[{}] 状态检查失败 (尝试 {}/{}): {}", 
+                          self.config.username, retry_count, MAX_RETRIES, e);
+                    
+                    // 指数退避: 2^retry_count 秒
+                    let delay = std::time::Duration::from_secs(2u64.pow(retry_count));
+                    if self.interruptible_sleep(delay).await {
+                        return Err(anyhow!("收到关闭信号，中断状态检查重试"));
+                    }
+                }
+                Err(e) => {
+                    if retry_count > 0 {
+                        error!("[{}] 状态检查最终失败 (尝试了 {} 次): {}", 
+                               self.config.username, retry_count + 1, e);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    /// 内部状态检查实现
+    async fn check_status_internal(
+        &mut self,
+        previous_status: &mut StreamStatus,
+    ) -> Result<StreamStatus> {
         let uniq = Self::generate_uniq();
         let url = format!(
             "https://stripchat.com/api/front/v2/models/username/{}/cam?uniq={}",
@@ -642,6 +704,18 @@ impl StripChatRecorder {
                 return Ok(status);
             }
             status if !status.is_success() => {
+                // 检查是否为认证相关错误
+                if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+                    warn!("[{}] 检测到认证错误 (HTTP {}), 尝试刷新cookies", self.config.username, status);
+                    
+                    // 尝试刷新cookies
+                    if let Err(e) = Self::refresh_cookies_only(&self.client, &self.config.username).await {
+                        debug!("[{}] Cookie刷新失败: {}", self.config.username, e);
+                    }
+                    
+                    return Err(anyhow!("认证失败，已尝试刷新cookies: HTTP {}", status));
+                }
+                
                 let error_status = StreamStatus::Error;
                 error!("[{}] 状态: 错误 (HTTP {})", self.config.username, status);
                 // 只在状态变化时更新 previous_status
@@ -656,8 +730,32 @@ impl StripChatRecorder {
 
         self.last_info = Some(api_response.clone());
 
-        let status = match api_response.model.status.as_str() {
-            "public" if api_response.is_cam_available => {
+        // 处理错误响应
+        if let Some(error) = &api_response.error {
+            let error_status = match error.as_str() {
+                "Not Found" => StreamStatus::Offline,
+                _ => StreamStatus::Error,
+            };
+            info!("[{}] 状态: {} ({})", self.config.username, 
+                  if matches!(error_status, StreamStatus::Offline) { "离线" } else { "错误" }, 
+                  error);
+            if std::mem::discriminant(&error_status) != std::mem::discriminant(previous_status) {
+                *previous_status = error_status.clone();
+            }
+            return Ok(error_status);
+        }
+
+        // 获取模型信息，优先使用新格式
+        let model_info = api_response.user
+            .as_ref()
+            .map(|u| &u.user)
+            .or(api_response.model.as_ref())
+            .ok_or_else(|| anyhow!("API响应中缺少用户/模型信息"))?;
+
+        let is_cam_available = api_response.is_cam_available.unwrap_or(false);
+        
+        let status = match model_info.status.as_str() {
+            "public" if is_cam_available => {
                 let final_status = api_response
                     .cam
                     .as_ref()
@@ -923,7 +1021,7 @@ impl StripChatRecorder {
         debug!("[{}] M3U8 解码器开始处理", username);
         
         // 首先提取MOUFLON参数
-        let (psch, pkey) = Self::extract_mouflon_from_m3u(content);
+        let (_psch, pkey) = Self::extract_mouflon_from_m3u(content);
         let pkey = match pkey {
             Some(key) => key,
             None => {
