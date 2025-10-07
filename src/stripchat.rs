@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use base64::{Engine as _, engine::general_purpose};
-use chrono::Utc;
+use chrono::Local;
 use log::{debug, error, info, warn};
 use regex::Regex;
 use reqwest::{
@@ -1059,7 +1059,7 @@ impl StripChatRecorder {
 
     /// 生成输出文件名
     fn generate_output_filename(&self) -> PathBuf {
-        let timestamp = Utc::now().format("%Y-%m-%d-%H-%M-%S");
+        let timestamp = Local::now().format("%Y-%m-%d-%H-%M-%S");
         let filename = format!("{}-{}.mp4", self.config.username, timestamp);
 
         let mut path = PathBuf::from(&self.config.output_dir);
