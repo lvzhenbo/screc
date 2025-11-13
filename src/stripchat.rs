@@ -27,6 +27,8 @@ pub enum StreamStatus {
     LongOffline, // 长时间离线
     Error,       // 错误
     Unknown,     // 未知
+    NotExist,    // 不存在（模特已删除）
+    Restricted,  // 受限（地理封锁）
 }
 
 #[derive(Debug, Clone)]
@@ -39,20 +41,24 @@ enum CookieSource {
 #[derive(Debug, Clone, Deserialize)]
 struct ApiResponse {
     #[serde(rename = "user")]
-    user: Option<UserInfo>, // 用户信息 (新API格式)
+    user: Option<UserInfoWrapper>, // 用户信息 (新API格式)
     model: Option<ModelInfo>, // 模特信息 (兼容旧格式)
     cam: Option<CamInfo>,     // 摄像头信息
     error: Option<String>,    // 错误信息
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct UserInfo {
+struct UserInfoWrapper {
     user: ModelInfo, // 嵌套的用户信息
+    #[serde(rename = "isGeoBanned")]
+    is_geo_banned: Option<bool>, // 是否地理封锁
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct ModelInfo {
     status: String, // 状态
+    #[serde(rename = "isDeleted")]
+    is_deleted: Option<bool>, // 是否已删除
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -618,6 +624,20 @@ impl StripChatRecorder {
                         return Ok(());
                     }
                 }
+                StreamStatus::NotExist => {
+                    // 模特已删除，停止监控
+                    info!("[{}] 模特账号已删除，停止监控", self.config.username);
+                    return Ok(());
+                }
+                StreamStatus::Restricted => {
+                    // 地理封锁，每5分钟检查一次
+                    if self
+                        .interruptible_sleep(tokio::time::Duration::from_secs(300))
+                        .await
+                    {
+                        return Ok(());
+                    }
+                }
             }
         }
     }
@@ -760,6 +780,31 @@ impl StripChatRecorder {
             .map(|u| &u.user)
             .or(api_response.model.as_ref())
             .ok_or_else(|| anyhow!("API响应中缺少用户/模型信息"))?;
+
+        // 检查是否已删除
+        if model_info.is_deleted.unwrap_or(false) {
+            let status = StreamStatus::NotExist;
+            info!("[{}] 状态: 模特已删除", self.config.username);
+            if std::mem::discriminant(&status) != std::mem::discriminant(previous_status) {
+                *previous_status = status.clone();
+            }
+            return Ok(status);
+        }
+
+        // 检查是否地理封锁
+        if api_response
+            .user
+            .as_ref()
+            .and_then(|u| u.is_geo_banned)
+            .unwrap_or(false)
+        {
+            let status = StreamStatus::Restricted;
+            info!("[{}] 状态: 地理封锁", self.config.username);
+            if std::mem::discriminant(&status) != std::mem::discriminant(previous_status) {
+                *previous_status = status.clone();
+            }
+            return Ok(status);
+        }
 
         let is_cam_available = api_response
             .cam
@@ -1041,38 +1086,17 @@ impl StripChatRecorder {
     ) -> String {
         debug!("[{}] M3U8 解码器开始处理", username);
 
-        // 首先提取MOUFLON参数
-        let (_psch, pkey) = Self::extract_mouflon_from_m3u(content);
-        let pkey = match pkey {
+        // 使用改进的提取函数，直接获取解密密钥
+        let (_psch, _pkey, decryption_key) = 
+            Self::extract_mouflon_from_m3u_with_key(content, mouflon_keys, doppio_js_content);
+        
+        let decryption_key = match decryption_key {
             Some(key) => key,
             None => {
-                debug!("[{}] 未发现MOUFLON参数，返回原始内容", username);
+                debug!("[{}] 未发现MOUFLON参数或无法获取解密密钥，返回原始内容", username);
                 return content.to_string();
             }
         };
-
-        // 获取解密密钥
-        let decryption_key = mouflon_keys
-            .get(&pkey)
-            .cloned()
-            .or_else(|| {
-                // 尝试从doppio.js动态提取
-                if let Some(js_content) = doppio_js_content {
-                    let pattern = format!(r#""{}:(.*?)""#, regex::escape(&pkey));
-                    if let Some(captures) = Regex::new(&pattern).unwrap().captures(js_content) {
-                        debug!("[{}] 为pkey {} 动态提取到MOUFLON密钥", username, pkey);
-                        Some(captures[1].to_string())
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| {
-                warn!("[{}] 无法获取MOUFLON密钥，使用默认密钥", username);
-                "Quean4cai9boJa5a".to_string()
-            });
 
         let mut decoded = Vec::new();
         let lines: Vec<&str> = content.lines().collect();
@@ -1112,7 +1136,56 @@ impl StripChatRecorder {
         decoded.join("\n")
     }
 
-    /// 提取MOUFLON参数
+    /// 提取MOUFLON参数 - 改进版，支持多个MOUFLON头并返回解密密钥
+    fn extract_mouflon_from_m3u_with_key(
+        content: &str,
+        mouflon_keys: &HashMap<String, String>,
+        doppio_js_content: &Option<String>,
+    ) -> (Option<String>, Option<String>, Option<String>) {
+        let needle = "#EXT-X-MOUFLON:";
+        let mut start = 0;
+        
+        // 遍历内容查找所有MOUFLON头
+        while let Some(pos) = content[start..].find(needle) {
+            let mouflon_start = start + pos;
+            if let Some(line_end) = content[mouflon_start..].find('\n') {
+                let line = &content[mouflon_start..mouflon_start + line_end];
+                let parts: Vec<&str> = line.split(':').collect();
+                
+                if parts.len() >= 4 {
+                    let psch = parts[2].to_string();
+                    let pkey = parts[3].to_string();
+                    
+                    // 尝试获取解密密钥
+                    let pdkey = mouflon_keys
+                        .get(&pkey)
+                        .cloned()
+                        .or_else(|| {
+                            // 从doppio.js动态提取
+                            if let Some(js_content) = doppio_js_content {
+                                let pattern = format!(r#""{}:(.*?)""#, regex::escape(&pkey));
+                                if let Ok(re) = Regex::new(&pattern) {
+                                    if let Some(captures) = re.captures(js_content) {
+                                        return Some(captures[1].to_string());
+                                    }
+                                }
+                            }
+                            None
+                        });
+                    
+                    // 如果找到了有效的解密密钥，返回结果
+                    if pdkey.is_some() {
+                        return (Some(psch), Some(pkey), pdkey);
+                    }
+                }
+            }
+            start = mouflon_start + needle.len();
+        }
+        
+        (None, None, None)
+    }
+
+    /// 提取MOUFLON参数（简化版，用于向后兼容）
     fn extract_mouflon_from_m3u(content: &str) -> (Option<String>, Option<String>) {
         if let Some(line) = content
             .lines()
