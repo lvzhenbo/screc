@@ -118,8 +118,6 @@ pub struct StripChatRecorder {
     mouflon_keys: std::collections::HashMap<String, String>, // MOUFLON密钥缓存
     main_js_content: Option<String>,                         // main.js内容缓存
     doppio_js_content: Option<String>,                       // doppio.js内容缓存
-    last_status_check: Option<std::time::Instant>,           // 上次状态检查时间
-    status_cache_duration: std::time::Duration,              // 状态缓存持续时间
 }
 
 impl StripChatRecorder {
@@ -165,8 +163,6 @@ impl StripChatRecorder {
             mouflon_keys: std::collections::HashMap::new(),
             main_js_content: None,
             doppio_js_content: None,
-            last_status_check: None,
-            status_cache_duration: std::time::Duration::from_secs(5), // 5秒缓存
         };
 
         // 初始化静态数据
@@ -308,44 +304,6 @@ impl StripChatRecorder {
             || error_str.contains("503")
             || error_str.contains("502")
             || error_str.contains("500")
-    }
-
-    /// 动态提取MOUFLON解密密钥
-    fn get_mouflon_decryption_key(&mut self, pkey: &str) -> Result<String> {
-        // 从缓存中查找
-        if let Some(cached_key) = self.mouflon_keys.get(pkey) {
-            return Ok(cached_key.clone());
-        }
-
-        // 如果没有doppio.js内容，返回错误
-        let doppio_js_content = self
-            .doppio_js_content
-            .as_ref()
-            .ok_or_else(|| anyhow!("doppio.js内容未初始化"))?;
-
-        // 从doppio.js中提取密钥
-        let pattern = format!(r#""{}:(.*?)""#, regex::escape(pkey));
-        if let Some(captures) = Regex::new(&pattern).unwrap().captures(doppio_js_content) {
-            let key = captures[1].to_string();
-            debug!(
-                "[{}] 为pkey {} 提取到MOUFLON密钥",
-                self.config.username, pkey
-            );
-
-            // 缓存密钥
-            self.mouflon_keys.insert(pkey.to_string(), key.clone());
-            Ok(key)
-        } else {
-            // 如果动态提取失败，回退到硬编码密钥
-            warn!(
-                "[{}] 无法为pkey {} 动态提取MOUFLON密钥，使用默认密钥",
-                self.config.username, pkey
-            );
-            let fallback_key = "Quean4cai9boJa5a".to_string();
-            self.mouflon_keys
-                .insert(pkey.to_string(), fallback_key.clone());
-            Ok(fallback_key)
-        }
     }
 
     /// 设置关闭信号接收器
@@ -1166,11 +1124,6 @@ impl StripChatRecorder {
             }
         }
         (None, None)
-    }
-
-    // 保留旧的M3U8解密函数以向后兼容
-    fn m3u_decoder(content: &str, username: &str) -> String {
-        Self::m3u_decoder_with_dynamic_keys(content, username, &HashMap::new(), &None)
     }
 
     /// 解码 MOUFLON 加密数据

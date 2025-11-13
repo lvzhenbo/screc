@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio = { version = "1.47", features = [
+tokio = { version = "1.48.0", features = [
     "rt-multi-thread",
     "macros",
     "time",
@@ -13,21 +13,21 @@ tokio = { version = "1.47", features = [
     "fs",
     "io-util",
 ] }
-reqwest = { version = "0.12", features = ["json", "cookies", "socks"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-sha2 = "0.10"
-base64 = "0.22"
+reqwest = { version = "0.12.24", features = ["json", "cookies", "socks"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+sha2 = "0.10.9"
+base64 = "0.22.1"
 m3u8-rs = "6.0"
-url = "2.5"
-chrono = { version = "0.4", features = ["serde"] }
-anyhow = "1.0"
-log = "0.4"
-fern = "0.7"
+url = "2.5.7"
+chrono = { version = "0.4.42", features = ["serde"] }
+anyhow = "1.0.100"
+log = "0.4.28"
+fern = "0.7.1"
 colored = "3.0"
-clap = { version = "4.5", features = ["derive"] }
-regex = "1.11"
-rand = "0.9"
+clap = { version = "4.5.51", features = ["derive"] }
+regex = "1.12.2"
+rand = "0.9.2"
 
 # 二进制大小优化配置
 [profile.release]
