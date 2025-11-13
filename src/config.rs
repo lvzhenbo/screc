@@ -62,11 +62,10 @@ impl AppConfig {
     /// 获取默认配置文件路径
     pub fn get_default_config_path() -> PathBuf {
         // 尝试获取程序所在目录
-        if let Ok(exe_path) = std::env::current_exe() {
-            if let Some(exe_dir) = exe_path.parent() {
+        if let Ok(exe_path) = std::env::current_exe()
+            && let Some(exe_dir) = exe_path.parent() {
                 return exe_dir.join("config.json");
             }
-        }
 
         // 如果获取失败，使用当前工作目录
         PathBuf::from("config.json")
@@ -169,11 +168,10 @@ impl AppConfig {
         let log_dir = self.get_log_file_path();
 
         // 尝试获取程序所在目录
-        if let Ok(exe_path) = std::env::current_exe() {
-            if let Some(exe_dir) = exe_path.parent() {
+        if let Ok(exe_path) = std::env::current_exe()
+            && let Some(exe_dir) = exe_path.parent() {
                 return exe_dir.join(&log_dir).join(filename);
             }
-        }
 
         // 如果获取失败，使用当前工作目录的logs文件夹
         PathBuf::from(&log_dir).join(filename)

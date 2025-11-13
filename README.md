@@ -4,6 +4,12 @@ screc 是一个 `100%` 由 AI 驱动的、用 Rust 编写的 StripChat 直播录
 
 代码参考了 [StreaMonitor](https://github.com/lossless1024/StreaMonitor) 项目，使用 Github Copilot 将 Python 代码转为 Rust 代码。
 
+## 最近更新
+
+- ✨ **改进的MOUFLON解密**: 支持多个MOUFLON头的处理和更好的错误处理（参考 StreaMonitor 最新提交）
+- 🚫 **删除账号检测**: 自动检测并停止监控已删除的模特账号
+- 🌍 **地理封锁检测**: 识别地理限制和受限内容，自动调整检查频率
+
 ## 功能特性
 
 - 🎥 **直播间监控**: 自动检测 StripChat 主播直播状态
@@ -331,6 +337,8 @@ export HTTPS_PROXY=https://proxy.example.com:8080
 - **Private** - 主播在私人秀中，每 5 秒检查一次状态
 - **Offline** - 主播离线，每 30 秒检查一次状态
 - **LongOffline** - 长时间离线，每 5 分钟检查一次状态
+- **NotExist** - 模特账号已删除，停止监控（自动退出）
+- **Restricted** - 地理封锁或访问受限，每 5 分钟检查一次状态
 - **Error** - 发生错误，等待 20 秒后重试
 - **Unknown** - 未知状态，每 30 秒检查一次状态
 

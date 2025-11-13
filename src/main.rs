@@ -208,15 +208,13 @@ async fn main() -> Result<()> {
         let log_file_path = app_config.generate_log_path();
 
         // 确保日志文件目录存在
-        if let Some(parent) = log_file_path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
+        if let Some(parent) = log_file_path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent) {
                 eprintln!("警告: 无法创建日志文件目录 {}: {}", parent.display(), e);
             }
-        }
 
         match std::fs::OpenOptions::new()
             .create(true)
-            .write(true)
             .append(true)
             .open(&log_file_path)
         {

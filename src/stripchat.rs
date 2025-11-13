@@ -27,6 +27,8 @@ pub enum StreamStatus {
     LongOffline, // 长时间离线
     Error,       // 错误
     Unknown,     // 未知
+    NotExist,    // 不存在（模特已删除）
+    Restricted,  // 受限（地理封锁）
 }
 
 #[derive(Debug, Clone)]
@@ -39,20 +41,24 @@ enum CookieSource {
 #[derive(Debug, Clone, Deserialize)]
 struct ApiResponse {
     #[serde(rename = "user")]
-    user: Option<UserInfo>, // 用户信息 (新API格式)
+    user: Option<UserInfoWrapper>, // 用户信息 (新API格式)
     model: Option<ModelInfo>, // 模特信息 (兼容旧格式)
     cam: Option<CamInfo>,     // 摄像头信息
     error: Option<String>,    // 错误信息
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct UserInfo {
+struct UserInfoWrapper {
     user: ModelInfo, // 嵌套的用户信息
+    #[serde(rename = "isGeoBanned")]
+    is_geo_banned: Option<bool>, // 是否地理封锁
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct ModelInfo {
     status: String, // 状态
+    #[serde(rename = "isDeleted")]
+    is_deleted: Option<bool>, // 是否已删除
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -398,15 +404,14 @@ impl StripChatRecorder {
             .map_err(|e| anyhow!("解析URL失败: {}", e))?;
 
         // 使用CookieStore trait方法从cookie jar中获取cookies
-        if let Some(cookie_header) = self.cookie_jar.cookies(&stripchat_url) {
-            if let Ok(cookie_str) = cookie_header.to_str() {
+        if let Some(cookie_header) = self.cookie_jar.cookies(&stripchat_url)
+            && let Ok(cookie_str) = cookie_header.to_str() {
                 debug!(
                     "[{}] 从cookie jar提取到的cookies: {}",
                     self.config.username, cookie_str
                 );
                 return Ok(cookie_str.to_string());
             }
-        }
 
         debug!("[{}] cookie jar中没有找到cookies", self.config.username);
         Ok(String::new())
@@ -503,11 +508,7 @@ impl StripChatRecorder {
                     // 为长时间录制会话启动 cookie 刷新任务
                     let client_clone = self.client.clone();
                     let username_clone = self.config.username.clone();
-                    let shutdown_rx_clone = if let Some(ref shutdown_rx) = self.shutdown_rx {
-                        Some(shutdown_rx.resubscribe())
-                    } else {
-                        None
-                    };
+                    let shutdown_rx_clone = self.shutdown_rx.as_ref().map(|shutdown_rx| shutdown_rx.resubscribe());
 
                     tokio::spawn(async move {
                         let mut interval =
@@ -583,15 +584,13 @@ impl StripChatRecorder {
                         {
                             return Ok(());
                         }
-                    } else {
-                        if self
-                            .interruptible_sleep(tokio::time::Duration::from_secs(
-                                self.config.check_interval,
-                            ))
-                            .await
-                        {
-                            return Ok(());
-                        }
+                    } else if self
+                        .interruptible_sleep(tokio::time::Duration::from_secs(
+                            self.config.check_interval,
+                        ))
+                        .await
+                    {
+                        return Ok(());
                     }
                 }
                 StreamStatus::LongOffline => {
@@ -613,6 +612,20 @@ impl StripChatRecorder {
                 StreamStatus::Unknown => {
                     if self
                         .interruptible_sleep(tokio::time::Duration::from_secs(30))
+                        .await
+                    {
+                        return Ok(());
+                    }
+                }
+                StreamStatus::NotExist => {
+                    // 模特已删除，停止监控
+                    info!("[{}] 模特账号已删除，停止监控", self.config.username);
+                    return Ok(());
+                }
+                StreamStatus::Restricted => {
+                    // 地理封锁，每5分钟检查一次
+                    if self
+                        .interruptible_sleep(tokio::time::Duration::from_secs(300))
                         .await
                     {
                         return Ok(());
@@ -760,6 +773,31 @@ impl StripChatRecorder {
             .map(|u| &u.user)
             .or(api_response.model.as_ref())
             .ok_or_else(|| anyhow!("API响应中缺少用户/模型信息"))?;
+
+        // 检查是否已删除
+        if model_info.is_deleted.unwrap_or(false) {
+            let status = StreamStatus::NotExist;
+            info!("[{}] 状态: 模特已删除", self.config.username);
+            if std::mem::discriminant(&status) != std::mem::discriminant(previous_status) {
+                *previous_status = status.clone();
+            }
+            return Ok(status);
+        }
+
+        // 检查是否地理封锁
+        if api_response
+            .user
+            .as_ref()
+            .and_then(|u| u.is_geo_banned)
+            .unwrap_or(false)
+        {
+            let status = StreamStatus::Restricted;
+            info!("[{}] 状态: 地理封锁", self.config.username);
+            if std::mem::discriminant(&status) != std::mem::discriminant(previous_status) {
+                *previous_status = status.clone();
+            }
+            return Ok(status);
+        }
 
         let is_cam_available = api_response
             .cam
@@ -1041,38 +1079,17 @@ impl StripChatRecorder {
     ) -> String {
         debug!("[{}] M3U8 解码器开始处理", username);
 
-        // 首先提取MOUFLON参数
-        let (_psch, pkey) = Self::extract_mouflon_from_m3u(content);
-        let pkey = match pkey {
+        // 使用改进的提取函数，直接获取解密密钥
+        let (_psch, _pkey, decryption_key) = 
+            Self::extract_mouflon_from_m3u_with_key(content, mouflon_keys, doppio_js_content);
+        
+        let decryption_key = match decryption_key {
             Some(key) => key,
             None => {
-                debug!("[{}] 未发现MOUFLON参数，返回原始内容", username);
+                debug!("[{}] 未发现MOUFLON参数或无法获取解密密钥，返回原始内容", username);
                 return content.to_string();
             }
         };
-
-        // 获取解密密钥
-        let decryption_key = mouflon_keys
-            .get(&pkey)
-            .cloned()
-            .or_else(|| {
-                // 尝试从doppio.js动态提取
-                if let Some(js_content) = doppio_js_content {
-                    let pattern = format!(r#""{}:(.*?)""#, regex::escape(&pkey));
-                    if let Some(captures) = Regex::new(&pattern).unwrap().captures(js_content) {
-                        debug!("[{}] 为pkey {} 动态提取到MOUFLON密钥", username, pkey);
-                        Some(captures[1].to_string())
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| {
-                warn!("[{}] 无法获取MOUFLON密钥，使用默认密钥", username);
-                "Quean4cai9boJa5a".to_string()
-            });
 
         let mut decoded = Vec::new();
         let lines: Vec<&str> = content.lines().collect();
@@ -1081,8 +1098,7 @@ impl StripChatRecorder {
         while i < lines.len() {
             let line = lines[i];
 
-            if line.starts_with("#EXT-X-MOUFLON:FILE:") {
-                let encrypted_data = &line[20..];
+            if let Some(encrypted_data) = line.strip_prefix("#EXT-X-MOUFLON:FILE:") {
                 debug!("[{}] 在索引 {} 发现 MOUFLON FILE 行", username, i);
 
                 match Self::decode_mouflon(encrypted_data, &decryption_key) {
@@ -1112,7 +1128,56 @@ impl StripChatRecorder {
         decoded.join("\n")
     }
 
-    /// 提取MOUFLON参数
+    /// 提取MOUFLON参数 - 改进版，支持多个MOUFLON头并返回解密密钥
+    fn extract_mouflon_from_m3u_with_key(
+        content: &str,
+        mouflon_keys: &HashMap<String, String>,
+        doppio_js_content: &Option<String>,
+    ) -> (Option<String>, Option<String>, Option<String>) {
+        let needle = "#EXT-X-MOUFLON:";
+        let mut start = 0;
+        
+        // 遍历内容查找所有MOUFLON头
+        while let Some(pos) = content[start..].find(needle) {
+            let mouflon_start = start + pos;
+            if let Some(line_end) = content[mouflon_start..].find('\n') {
+                let line = &content[mouflon_start..mouflon_start + line_end];
+                let parts: Vec<&str> = line.split(':').collect();
+                
+                if parts.len() >= 4 {
+                    let psch = parts[2].to_string();
+                    let pkey = parts[3].to_string();
+                    
+                    // 尝试获取解密密钥
+                    let pdkey = mouflon_keys
+                        .get(&pkey)
+                        .cloned()
+                        .or_else(|| {
+                            // 从doppio.js动态提取
+                            if let Some(js_content) = doppio_js_content {
+                                let pattern = format!(r#""{}:(.*?)""#, regex::escape(&pkey));
+                                if let Ok(re) = Regex::new(&pattern)
+                                    && let Some(captures) = re.captures(js_content) {
+                                        return Some(captures[1].to_string());
+                                    }
+                            }
+                            None
+                        });
+                    
+                    // 如果找到了有效的解密密钥，返回结果
+                    if pdkey.is_some() {
+                        return (Some(psch), Some(pkey), pdkey);
+                    }
+                }
+            }
+            start = mouflon_start + needle.len();
+        }
+        
+        (None, None, None)
+    }
+
+    /// 提取MOUFLON参数（简化版，用于向后兼容）
+    #[allow(dead_code)]
     fn extract_mouflon_from_m3u(content: &str) -> (Option<String>, Option<String>) {
         if let Some(line) = content
             .lines()
@@ -1136,7 +1201,7 @@ impl StripChatRecorder {
 
         // 如需要，正确添加 base64 填充
         let mut padded = encrypted_b64.to_string();
-        while padded.len() % 4 != 0 {
+        while !padded.len().is_multiple_of(4) {
             padded.push('=');
         }
 
@@ -1226,8 +1291,8 @@ impl StripChatRecorder {
             }
             CookieSource::ConfigFile | CookieSource::None => {
                 // 从cookie jar提取cookies
-                if let Ok(cookies) = self.extract_cookies_from_client().await {
-                    if !cookies.is_empty() {
+                if let Ok(cookies) = self.extract_cookies_from_client().await
+                    && !cookies.is_empty() {
                         // 更新AppConfig中的cookies
                         let mut app_config = self.app_config.lock().await;
                         app_config.cookies = Some(cookies);
@@ -1247,7 +1312,6 @@ impl StripChatRecorder {
 
                         debug!("[{}] cookies已保存到配置", self.config.username);
                     }
-                }
             }
         }
 

@@ -246,11 +246,10 @@ impl HlsDownloader {
         }
 
         // 清理临时文件
-        if temp_path.exists() {
-            if let Err(e) = tokio::fs::remove_file(&temp_path).await {
+        if temp_path.exists()
+            && let Err(e) = tokio::fs::remove_file(&temp_path).await {
                 error!("[{}] 清理临时文件失败: {}", self.username, e);
             }
-        }
 
         download_result
     }
@@ -305,23 +304,20 @@ impl HlsDownloader {
 
         // 从 M3U8 内容提取分片目标持续时间
         for line in content.lines() {
-            if line.starts_with("#EXT-X-TARGETDURATION:") {
-                if let Some(duration_str) = line.strip_prefix("#EXT-X-TARGETDURATION:") {
-                    if let Ok(duration) = duration_str.parse::<u64>() {
-                        target_duration = duration;
-                        debug!(
-                            "[{}] 检测到分片目标持续时间: {} 秒",
-                            self.username, target_duration
-                        );
-                        break;
-                    }
+            if let Some(duration_str) = line.strip_prefix("#EXT-X-TARGETDURATION:")
+                && let Ok(duration) = duration_str.parse::<u64>() {
+                    target_duration = duration;
+                    debug!(
+                        "[{}] 检测到分片目标持续时间: {} 秒",
+                        self.username, target_duration
+                    );
+                    break;
                 }
-            }
         }
 
         // 检查 #EXT-X-MAP 初始化分片
-        if !self.init_segment_downloaded {
-            if let Some(init_url) = self.extract_init_segment(&content, playlist_url)? {
+        if !self.init_segment_downloaded
+            && let Some(init_url) = self.extract_init_segment(&content, playlist_url)? {
                 debug!("[{}] 下载初始化分片: {}", self.username, init_url);
                 match self.download_segment(&init_url, output_file).await {
                     Ok(()) => {
@@ -335,7 +331,6 @@ impl HlsDownloader {
                     }
                 }
             }
-        }
 
         let playlist = m3u8_rs::parse_playlist_res(content.as_bytes())
             .map_err(|e| anyhow!("解析 M3U8 失败: {:?}", e))?;
