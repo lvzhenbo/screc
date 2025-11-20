@@ -69,6 +69,8 @@ struct CamInfo {
     is_cam_active: bool, // 摄像头是否激活
     #[serde(rename = "streamName")]
     stream_name: String, // 流名称
+    #[serde(rename = "modelToken")]
+    model_token: Option<String>, // 模特令牌（用于私人秀等场景）
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -564,6 +566,33 @@ impl StripChatRecorder {
                 }
                 StreamStatus::Private => {
                     offline_time = 0; // 重置离线计数器
+
+                    // 检查是否有modelToken，如果有则尝试录制
+                    if let Some(ref last_info) = self.last_info {
+                        if let Some(ref cam) = last_info.cam {
+                            if cam.model_token.is_some() {
+                                info!(
+                                    "[{}] 私人秀检测到modelToken，尝试录制",
+                                    self.config.username
+                                );
+                                if let Err(e) = self.record_stream().await {
+                                    error!("[{}] 私人秀录制失败: {}", self.config.username, e);
+                                }
+                                // 录制完成后等待一段时间再检查
+                                if self
+                                    .interruptible_sleep(tokio::time::Duration::from_secs(
+                                        self.config.check_interval,
+                                    ))
+                                    .await
+                                {
+                                    return Ok(());
+                                }
+                                continue;
+                            }
+                        }
+                    }
+
+                    // 没有modelToken，按原逻辑等待
                     if self
                         .interruptible_sleep(tokio::time::Duration::from_secs(5))
                         .await
@@ -922,6 +951,7 @@ impl StripChatRecorder {
         };
 
         let stream_name = &cam.stream_name;
+        let model_token = &cam.model_token;
 
         // 随机选择CDN主机 (模仿参考实现)
         use rand::prelude::IndexedRandom;
@@ -930,10 +960,17 @@ impl StripChatRecorder {
             .choose(&mut rand::rng())
             .unwrap_or(&"doppiocdn.com");
 
-        let master_url = format!(
+        // 构建基础URL
+        let mut master_url = format!(
             "https://edge-hls.{}/hls/{}/master/{}_auto.m3u8",
             selected_host, stream_name, stream_name
         );
+
+        // 如果有modelToken，添加到URL参数中（参考JS的buildM3u8Url逻辑）
+        if let Some(token) = model_token {
+            master_url.push_str(&format!("?aclAuth={}", token));
+            debug!("[{}] 使用modelToken添加认证参数到URL", self.config.username);
+        }
 
         debug!("[{}] 获取主播放列表: {}", self.config.username, master_url);
 
