@@ -405,13 +405,14 @@ impl StripChatRecorder {
 
         // 使用CookieStore trait方法从cookie jar中获取cookies
         if let Some(cookie_header) = self.cookie_jar.cookies(&stripchat_url)
-            && let Ok(cookie_str) = cookie_header.to_str() {
-                debug!(
-                    "[{}] 从cookie jar提取到的cookies: {}",
-                    self.config.username, cookie_str
-                );
-                return Ok(cookie_str.to_string());
-            }
+            && let Ok(cookie_str) = cookie_header.to_str()
+        {
+            debug!(
+                "[{}] 从cookie jar提取到的cookies: {}",
+                self.config.username, cookie_str
+            );
+            return Ok(cookie_str.to_string());
+        }
 
         debug!("[{}] cookie jar中没有找到cookies", self.config.username);
         Ok(String::new())
@@ -508,7 +509,10 @@ impl StripChatRecorder {
                     // 为长时间录制会话启动 cookie 刷新任务
                     let client_clone = self.client.clone();
                     let username_clone = self.config.username.clone();
-                    let shutdown_rx_clone = self.shutdown_rx.as_ref().map(|shutdown_rx| shutdown_rx.resubscribe());
+                    let shutdown_rx_clone = self
+                        .shutdown_rx
+                        .as_ref()
+                        .map(|shutdown_rx| shutdown_rx.resubscribe());
 
                     tokio::spawn(async move {
                         let mut interval =
@@ -959,18 +963,35 @@ impl StripChatRecorder {
         self.parse_master_playlist(&content, &master_url)
     }
 
-    /// 提取 MOUFLON 参数
+    /// 提取 MOUFLON 参数 (修改：获取最后一个 PSCH 行，而非第一个)
     fn extract_mouflon_params(&mut self, content: &str) {
-        if let Some(line) = content
-            .lines()
-            .find(|line| line.contains("#EXT-X-MOUFLON:"))
-        {
-            let parts: Vec<&str> = line.split(':').collect();
-            if let [_, _, psch, pkey, ..] = parts.as_slice() {
-                self.psch = Some(psch.to_string());
-                self.pkey = Some(pkey.to_string());
-                debug!("[{}] 提取 MOUFLON 参数", self.config.username);
+        let mut found_psch = None;
+        let mut found_pkey = None;
+
+        // Iterate through ALL lines to find MOUFLON lines and keep the LAST occurrence
+        for line in content.lines() {
+            if line.starts_with("#EXT-X-MOUFLON:PSCH:") {
+                // More specific than just "#EXT-X-MOUFLON:"
+                let parts: Vec<&str> = line.split(':').collect();
+                // It takes parts[2] as psch and parts[3] as pkey.
+                // If the line is #EXT-X-MOUFLON:PSCH:v1:Zokee2OhPh9kugh4, parts[2]=v1, parts[3]=Zokee2OhPh9kugh4
+                // This logic overwrites the values, so the last occurrence wins
+                if parts.len() >= 4 {
+                    // Ensure we have enough parts to avoid index out of bounds
+                    found_psch = Some(parts[2].to_string()); // e.g., "v1"
+                    found_pkey = Some(parts[3].to_string()); // e.g., "Zokee2OhPh9kugh4"
+                }
             }
+        }
+
+        // Assign the last found values (or None if none were found)
+        self.psch = found_psch;
+        self.pkey = found_pkey;
+
+        if self.psch.is_some() && self.pkey.is_some() {
+            debug!("[{}] 提取 MOUFLON 参数 (最后一个)", self.config.username);
+        } else {
+            debug!("[{}] 未在内容中找到 MOUFLON 参数", self.config.username);
         }
     }
 
@@ -1080,13 +1101,16 @@ impl StripChatRecorder {
         debug!("[{}] M3U8 解码器开始处理", username);
 
         // 使用改进的提取函数，直接获取解密密钥
-        let (_psch, _pkey, decryption_key) = 
+        let (_psch, _pkey, decryption_key) =
             Self::extract_mouflon_from_m3u_with_key(content, mouflon_keys, doppio_js_content);
-        
+
         let decryption_key = match decryption_key {
             Some(key) => key,
             None => {
-                debug!("[{}] 未发现MOUFLON参数或无法获取解密密钥，返回原始内容", username);
+                debug!(
+                    "[{}] 未发现MOUFLON参数或无法获取解密密钥，返回原始内容",
+                    username
+                );
                 return content.to_string();
             }
         };
@@ -1136,34 +1160,32 @@ impl StripChatRecorder {
     ) -> (Option<String>, Option<String>, Option<String>) {
         let needle = "#EXT-X-MOUFLON:";
         let mut start = 0;
-        
+
         // 遍历内容查找所有MOUFLON头
         while let Some(pos) = content[start..].find(needle) {
             let mouflon_start = start + pos;
             if let Some(line_end) = content[mouflon_start..].find('\n') {
                 let line = &content[mouflon_start..mouflon_start + line_end];
                 let parts: Vec<&str> = line.split(':').collect();
-                
+
                 if parts.len() >= 4 {
                     let psch = parts[2].to_string();
                     let pkey = parts[3].to_string();
-                    
+
                     // 尝试获取解密密钥
-                    let pdkey = mouflon_keys
-                        .get(&pkey)
-                        .cloned()
-                        .or_else(|| {
-                            // 从doppio.js动态提取
-                            if let Some(js_content) = doppio_js_content {
-                                let pattern = format!(r#""{}:(.*?)""#, regex::escape(&pkey));
-                                if let Ok(re) = Regex::new(&pattern)
-                                    && let Some(captures) = re.captures(js_content) {
-                                        return Some(captures[1].to_string());
-                                    }
+                    let pdkey = mouflon_keys.get(&pkey).cloned().or_else(|| {
+                        // 从doppio.js动态提取
+                        if let Some(js_content) = doppio_js_content {
+                            let pattern = format!(r#""{}:(.*?)""#, regex::escape(&pkey));
+                            if let Ok(re) = Regex::new(&pattern)
+                                && let Some(captures) = re.captures(js_content)
+                            {
+                                return Some(captures[1].to_string());
                             }
-                            None
-                        });
-                    
+                        }
+                        None
+                    });
+
                     // 如果找到了有效的解密密钥，返回结果
                     if pdkey.is_some() {
                         return (Some(psch), Some(pkey), pdkey);
@@ -1172,7 +1194,7 @@ impl StripChatRecorder {
             }
             start = mouflon_start + needle.len();
         }
-        
+
         (None, None, None)
     }
 
@@ -1292,26 +1314,27 @@ impl StripChatRecorder {
             CookieSource::ConfigFile | CookieSource::None => {
                 // 从cookie jar提取cookies
                 if let Ok(cookies) = self.extract_cookies_from_client().await
-                    && !cookies.is_empty() {
-                        // 更新AppConfig中的cookies
-                        let mut app_config = self.app_config.lock().await;
-                        app_config.cookies = Some(cookies);
+                    && !cookies.is_empty()
+                {
+                    // 更新AppConfig中的cookies
+                    let mut app_config = self.app_config.lock().await;
+                    app_config.cookies = Some(cookies);
 
-                        // 如果有配置文件路径，保存到文件
-                        if let Some(config_path) = &self.config_file_path {
-                            if let Err(e) = app_config.save_to_file(config_path) {
-                                debug!("[{}] 保存配置文件失败: {}", self.config.username, e);
-                            } else {
-                                debug!(
-                                    "[{}] 配置文件已更新: {}",
-                                    self.config.username,
-                                    config_path.display()
-                                );
-                            }
+                    // 如果有配置文件路径，保存到文件
+                    if let Some(config_path) = &self.config_file_path {
+                        if let Err(e) = app_config.save_to_file(config_path) {
+                            debug!("[{}] 保存配置文件失败: {}", self.config.username, e);
+                        } else {
+                            debug!(
+                                "[{}] 配置文件已更新: {}",
+                                self.config.username,
+                                config_path.display()
+                            );
                         }
-
-                        debug!("[{}] cookies已保存到配置", self.config.username);
                     }
+
+                    debug!("[{}] cookies已保存到配置", self.config.username);
+                }
             }
         }
 

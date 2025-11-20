@@ -25,7 +25,7 @@ anyhow = "1.0.100"
 log = "0.4.28"
 fern = "0.7.1"
 colored = "3.0"
-clap = { version = "4.5.51", features = ["derive"] }
+clap = { version = "4.5.53", features = ["derive"] }
 regex = "1.12.2"
 rand = "0.9.2"
 
