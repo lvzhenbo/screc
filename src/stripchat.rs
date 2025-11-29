@@ -247,39 +247,99 @@ impl StripChatRecorder {
         let main_js_content = main_js_response.text().await?;
 
         // 从main.js中提取doppio.js文件名
-        if let Some(captures) = Regex::new(r#"require\("\./([^"]*Doppio[^"]*\.js)"\)"#)
-            .unwrap()
-            .captures(&main_js_content)
-        {
-            let doppio_js_name = &captures[1];
-            let doppio_js_url = format!("{}/{}", mmp_base, doppio_js_name);
+        // 新格式使用webpack代码分割: chunk-Doppio-<hash>.js
+        // 需要从 {376:"Doppio",...} 和 {376:"<hash>",...} 中提取
+        let doppio_js_name = self.extract_doppio_chunk_name(&main_js_content)?;
+        let doppio_js_url = format!("{}/{}", mmp_base, doppio_js_name);
 
-            debug!(
-                "[{}] 正在获取doppio.js: {}",
-                self.config.username, doppio_js_url
-            );
+        debug!(
+            "[{}] 正在获取doppio.js: {}",
+            self.config.username, doppio_js_url
+        );
 
-            let doppio_js_response = self.client.get(&doppio_js_url).send().await?;
-            if !doppio_js_response.status().is_success() {
-                return Err(anyhow!(
-                    "获取doppio.js失败: {}",
-                    doppio_js_response.status()
-                ));
-            }
-
-            let doppio_js_content = doppio_js_response.text().await?;
-
-            // 缓存内容
-            self.static_data = Some(static_config);
-            self.main_js_content = Some(main_js_content);
-            self.doppio_js_content = Some(doppio_js_content);
-
-            debug!("[{}] 静态数据初始化完成", self.config.username);
-        } else {
-            return Err(anyhow!("无法从main.js中提取doppio.js文件名"));
+        let doppio_js_response = self.client.get(&doppio_js_url).send().await?;
+        if !doppio_js_response.status().is_success() {
+            return Err(anyhow!(
+                "获取doppio.js失败: {}",
+                doppio_js_response.status()
+            ));
         }
 
+        let doppio_js_content = doppio_js_response.text().await?;
+
+        // 缓存内容
+        self.static_data = Some(static_config);
+        self.main_js_content = Some(main_js_content);
+        self.doppio_js_content = Some(doppio_js_content);
+
+        debug!("[{}] 静态数据初始化完成", self.config.username);
+
         Ok(())
+    }
+
+    /// 从main.js中提取Doppio chunk文件名
+    /// 新版本webpack格式: chunk-Doppio-<hash>.js
+    fn extract_doppio_chunk_name(&self, main_js_content: &str) -> Result<String> {
+        // 方法1: 尝试匹配新的webpack代码分割格式
+        // 格式: n.u=e=>"chunk-"+({358:"Native",376:"Doppio",...}[e]||e)+"-"+{...,376:"hash",...}[e]+".js"
+
+        // 首先找到chunk名称映射，提取Doppio对应的chunk ID
+        // 匹配 {数字:"Doppio"} 格式
+        let chunk_id_regex = Regex::new(r#"\{[^}]*?(\d+)\s*:\s*"Doppio"[^}]*?\}"#).unwrap();
+
+        if let Some(chunk_captures) = chunk_id_regex.captures(main_js_content) {
+            let chunk_id = &chunk_captures[1];
+            debug!(
+                "[{}] 找到Doppio chunk ID: {}",
+                self.config.username, chunk_id
+            );
+
+            // 在整个内容中查找对应chunk ID的hash
+            // 查找包含该chunk ID和hash的映射
+            let hash_pattern = format!(r#"{}:"([a-f0-9]{{20}})""#, chunk_id);
+            let specific_hash_regex = Regex::new(&hash_pattern).unwrap();
+
+            // 需要找到hash映射表，格式类似: {0:"hash1",376:"hash2",...}
+            // 通常在 n.u=e=> 附近
+            if let Some(hash_captures) = specific_hash_regex.captures(main_js_content) {
+                let hash = &hash_captures[1];
+                let doppio_filename = format!("chunk-Doppio-{}.js", hash);
+                debug!(
+                    "[{}] 构建Doppio文件名: {}",
+                    self.config.username, doppio_filename
+                );
+                return Ok(doppio_filename);
+            }
+        }
+
+        // 方法2: 尝试旧格式 require("./...Doppio...js")
+        if let Some(captures) = Regex::new(r#"require\("\./([^"]*Doppio[^"]*\.js)"\)"#)
+            .unwrap()
+            .captures(main_js_content)
+        {
+            let doppio_filename = captures[1].to_string();
+            debug!(
+                "[{}] 使用旧格式找到Doppio文件名: {}",
+                self.config.username, doppio_filename
+            );
+            return Ok(doppio_filename);
+        }
+
+        // 方法3: 直接搜索chunk-Doppio-xxx.js格式
+        if let Some(captures) = Regex::new(r#"chunk-Doppio-([a-f0-9]+)\.js"#)
+            .unwrap()
+            .captures(main_js_content)
+        {
+            let hash = &captures[1];
+            let doppio_filename = format!("chunk-Doppio-{}.js", hash);
+            debug!(
+                "[{}] 直接匹配到Doppio文件名: {}",
+                self.config.username, doppio_filename
+            );
+            return Ok(doppio_filename);
+        }
+
+        Err(anyhow!("无法从main.js中提取doppio.js文件名"))
     }
 
     /// 生成随机uniq参数
