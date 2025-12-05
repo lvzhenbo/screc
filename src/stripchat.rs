@@ -692,10 +692,10 @@ impl StripChatRecorder {
                 StreamStatus::Private => {
                     offline_time = 0; // 重置离线计数器
 
-                    // 检查是否有modelToken，如果有则尝试录制
+                    // 检查是否有modelToken，如果有且不为空则尝试录制
                     if let Some(ref last_info) = self.last_info {
                         if let Some(ref cam) = last_info.cam {
-                            if cam.model_token.is_some() {
+                            if cam.model_token.as_ref().is_some_and(|t| !t.is_empty()) {
                                 info!(
                                     "[{}] 私人秀检测到modelToken，尝试录制",
                                     self.config.username
@@ -1091,10 +1091,12 @@ impl StripChatRecorder {
             selected_host, stream_name, stream_name
         );
 
-        // 如果有modelToken，添加到URL参数中（参考JS的buildM3u8Url逻辑）
+        // 如果有modelToken且不为空，添加到URL参数中（参考JS的buildM3u8Url逻辑）
         if let Some(token) = model_token {
-            master_url.push_str(&format!("?aclAuth={}", token));
-            debug!("[{}] 使用modelToken添加认证参数到URL", self.config.username);
+            if !token.is_empty() {
+                master_url.push_str(&format!("?aclAuth={}", token));
+                debug!("[{}] 使用modelToken添加认证参数到URL", self.config.username);
+            }
         }
 
         debug!("[{}] 获取主播放列表: {}", self.config.username, master_url);
