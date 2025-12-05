@@ -124,7 +124,6 @@ pub struct StripChatRecorder {
     shutdown_rx: Option<broadcast::Receiver<()>>,            // 关闭信号接收器
     static_data: Option<StaticConfig>,                       // StripChat静态配置数据
     mouflon_keys: std::collections::HashMap<String, String>, // MOUFLON密钥缓存
-    main_js_content: Option<String>,                         // main.js内容缓存
     doppio_js_content: Option<String>,                       // doppio.js内容缓存
 }
 
@@ -155,6 +154,16 @@ impl StripChatRecorder {
             config.cookies.as_deref(),
         )?;
 
+        // 初始化 MOUFLON 密钥映射
+        // 注意：pkey 不是解密密钥，而是密钥的 ID
+        // 需要通过此映射查找实际的解密密钥
+        let mut mouflon_keys = std::collections::HashMap::new();
+        // 已知的密钥映射（从 doppio.js 的 ns 对象中提取）
+        mouflon_keys.insert(
+            "Zeechoej4aleeshi".to_string(),
+            "ubahjae7goPoodi6".to_string(),
+        );
+
         let mut instance = Self {
             config,
             app_config: app_config.clone(),
@@ -168,13 +177,15 @@ impl StripChatRecorder {
             status: StreamStatus::Unknown,
             shutdown_rx: None,
             static_data: None,
-            mouflon_keys: std::collections::HashMap::new(),
-            main_js_content: None,
+            mouflon_keys,
             doppio_js_content: None,
         };
 
         // 初始化静态数据
         instance.initialize_static_data().await?;
+
+        // 从 doppio.js 提取更多密钥映射（如果可用）
+        instance.extract_mouflon_keys_from_doppio();
 
         // 根据cookie来源处理初始化
         match instance.cookie_source {
@@ -269,7 +280,6 @@ impl StripChatRecorder {
 
         // 缓存内容
         self.static_data = Some(static_config);
-        self.main_js_content = Some(main_js_content);
         self.doppio_js_content = Some(doppio_js_content);
 
         debug!("[{}] 静态数据初始化完成", self.config.username);
@@ -340,6 +350,61 @@ impl StripChatRecorder {
         }
 
         Err(anyhow!("无法从main.js中提取doppio.js文件名"))
+    }
+
+    /// 从 doppio.js 中提取 MOUFLON 密钥映射 (ns 对象)
+    ///
+    /// doppio.js 中包含一个名为 `ns` 的对象，它存储了 pkey 到实际解密密钥的映射。
+    /// 例如: ns = {"Zeechoej4aleeshi": "ubahjae7goPoodi6"}
+    ///
+    /// 由于代码是高度混淆的，我们尝试多种方法提取：
+    /// 1. 正则表达式匹配简单的对象字面量
+    /// 2. 搜索已知的密钥模式
+    fn extract_mouflon_keys_from_doppio(&mut self) {
+        let doppio_content = match &self.doppio_js_content {
+            Some(content) => content,
+            None => {
+                debug!(
+                    "[{}] doppio.js 内容不可用，跳过密钥提取",
+                    self.config.username
+                );
+                return;
+            }
+        };
+
+        debug!(
+            "[{}] 开始从 doppio.js 提取 MOUFLON 密钥映射",
+            self.config.username
+        );
+
+        // 方法1: 尝试匹配简单的对象字面量格式
+        // 格式: {"key1":"value1","key2":"value2"} 或 {key1:"value1",key2:"value2"}
+        let key_value_regex =
+            Regex::new(r#""([A-Za-z0-9]{16})"\s*:\s*"([A-Za-z0-9]{16})""#).unwrap();
+
+        for captures in key_value_regex.captures_iter(doppio_content) {
+            let pkey = captures[1].to_string();
+            let actual_key = captures[2].to_string();
+
+            // 验证这看起来像一个合理的密钥对
+            if !self.mouflon_keys.contains_key(&pkey) {
+                debug!(
+                    "[{}] 从 doppio.js 提取到密钥映射: {} -> {}",
+                    self.config.username, pkey, actual_key
+                );
+                self.mouflon_keys.insert(pkey, actual_key);
+            }
+        }
+
+        // 方法2: 搜索 ss() 函数返回的字符串数组中的密钥
+        // 这些字符串是 base64 编码的，解码后可能包含密钥
+        // 由于混淆太复杂，这里只记录日志，实际密钥已在初始化时硬编码
+
+        debug!(
+            "[{}] MOUFLON 密钥映射提取完成，共 {} 个密钥",
+            self.config.username,
+            self.mouflon_keys.len()
+        );
     }
 
     /// 生成随机uniq参数
@@ -1060,33 +1125,54 @@ impl StripChatRecorder {
         self.parse_master_playlist(&content, &master_url)
     }
 
-    /// 提取 MOUFLON 参数 (修改：获取最后一个 PSCH 行，而非第一个)
+    /// 提取 MOUFLON 参数 (修改：提取所有 PSCH 行中的第一个有效映射)
     fn extract_mouflon_params(&mut self, content: &str) {
         let mut found_psch = None;
         let mut found_pkey = None;
 
-        // Iterate through ALL lines to find MOUFLON lines and keep the LAST occurrence
+        // 遍历所有行查找 MOUFLON 行
+        // 优先使用我们有密钥映射的 pkey
         for line in content.lines() {
             if line.starts_with("#EXT-X-MOUFLON:PSCH:") {
-                // More specific than just "#EXT-X-MOUFLON:"
                 let parts: Vec<&str> = line.split(':').collect();
-                // It takes parts[2] as psch and parts[3] as pkey.
-                // If the line is #EXT-X-MOUFLON:PSCH:v1:Zokee2OhPh9kugh4, parts[2]=v1, parts[3]=Zokee2OhPh9kugh4
-                // This logic overwrites the values, so the last occurrence wins
                 if parts.len() >= 4 {
-                    // Ensure we have enough parts to avoid index out of bounds
-                    found_psch = Some(parts[2].to_string()); // e.g., "v1"
-                    found_pkey = Some(parts[3].to_string()); // e.g., "Zokee2OhPh9kugh4"
+                    let psch = parts[2].to_string();
+                    let pkey = parts[3].to_string();
+
+                    // 如果我们有这个 pkey 的密钥映射，优先使用它
+                    if self.mouflon_keys.contains_key(&pkey) {
+                        debug!("[{}] 找到有密钥映射的 pkey: {}", self.config.username, pkey);
+                        found_psch = Some(psch);
+                        found_pkey = Some(pkey);
+                        break; // 找到有映射的就停止
+                    }
+
+                    // 否则保存第一个找到的（作为备用）
+                    if found_psch.is_none() {
+                        found_psch = Some(psch);
+                        found_pkey = Some(pkey);
+                    }
                 }
             }
         }
 
-        // Assign the last found values (or None if none were found)
+        // Assign the found values
         self.psch = found_psch;
-        self.pkey = found_pkey;
+        self.pkey = found_pkey.clone();
 
         if self.psch.is_some() && self.pkey.is_some() {
-            debug!("[{}] 提取 MOUFLON 参数 (最后一个)", self.config.username);
+            let pkey = found_pkey.as_ref().unwrap();
+            if self.mouflon_keys.contains_key(pkey) {
+                debug!(
+                    "[{}] 提取 MOUFLON 参数: pkey={} (有密钥映射)",
+                    self.config.username, pkey
+                );
+            } else {
+                debug!(
+                    "[{}] 提取 MOUFLON 参数: pkey={} (无密钥映射，可能解密失败)",
+                    self.config.username, pkey
+                );
+            }
         } else {
             debug!("[{}] 未在内容中找到 MOUFLON 参数", self.config.username);
         }
@@ -1250,64 +1336,58 @@ impl StripChatRecorder {
     }
 
     /// 提取MOUFLON参数 - 改进版，支持多个MOUFLON头并返回解密密钥
+    ///
+    /// 重要说明：pkey 不是解密密钥，而是密钥的 ID！
+    /// 需要通过 mouflon_keys 映射查找实际的解密密钥。
+    /// 例如：pkey="Zeechoej4aleeshi" -> actual_key="ubahjae7goPoodi6"
     fn extract_mouflon_from_m3u_with_key(
         content: &str,
         mouflon_keys: &HashMap<String, String>,
-        doppio_js_content: &Option<String>,
+        _doppio_js_content: &Option<String>,
     ) -> (Option<String>, Option<String>, Option<String>) {
-        let needle = "#EXT-X-MOUFLON:";
+        let needle = "#EXT-X-MOUFLON:PSCH:";
         let mut start = 0;
 
-        // 遍历内容查找所有MOUFLON头
+        // 遍历内容查找所有MOUFLON PSCH头
         while let Some(pos) = content[start..].find(needle) {
             let mouflon_start = start + pos;
             if let Some(line_end) = content[mouflon_start..].find('\n') {
                 let line = &content[mouflon_start..mouflon_start + line_end];
+                // 格式: #EXT-X-MOUFLON:PSCH:v1:Zeechoej4aleeshi
+                // parts[0] = "#EXT-X-MOUFLON"
+                // parts[1] = "PSCH"
+                // parts[2] = "v1" (scheme)
+                // parts[3] = "Zeechoej4aleeshi" (key ID, 不是实际密钥!)
                 let parts: Vec<&str> = line.split(':').collect();
 
                 if parts.len() >= 4 {
                     let psch = parts[2].to_string();
                     let pkey = parts[3].to_string();
 
-                    // 尝试获取解密密钥
-                    let pdkey = mouflon_keys.get(&pkey).cloned().or_else(|| {
-                        // 从doppio.js动态提取
-                        if let Some(js_content) = doppio_js_content {
-                            let pattern = format!(r#""{}:(.*?)""#, regex::escape(&pkey));
-                            if let Ok(re) = Regex::new(&pattern)
-                                && let Some(captures) = re.captures(js_content)
-                            {
-                                return Some(captures[1].to_string());
-                            }
-                        }
-                        None
+                    // 从映射中查找实际的解密密钥
+                    // pkey 是密钥 ID，需要查找对应的实际密钥
+                    let decryption_key = mouflon_keys.get(&pkey).cloned().unwrap_or_else(|| {
+                        // 如果映射中没有找到，记录警告并尝试使用 pkey 本身
+                        // （这可能不会工作，但至少可以继续运行）
+                        debug!(
+                            "未在密钥映射中找到 pkey '{}' 的实际密钥，尝试使用 pkey 本身",
+                            pkey
+                        );
+                        pkey.clone()
                     });
 
-                    // 如果找到了有效的解密密钥，返回结果
-                    if pdkey.is_some() {
-                        return (Some(psch), Some(pkey), pdkey);
-                    }
+                    debug!(
+                        "MOUFLON: psch={}, pkey={}, decryption_key={}",
+                        psch, pkey, decryption_key
+                    );
+
+                    return (Some(psch), Some(pkey), Some(decryption_key));
                 }
             }
             start = mouflon_start + needle.len();
         }
 
         (None, None, None)
-    }
-
-    /// 提取MOUFLON参数（简化版，用于向后兼容）
-    #[allow(dead_code)]
-    fn extract_mouflon_from_m3u(content: &str) -> (Option<String>, Option<String>) {
-        if let Some(line) = content
-            .lines()
-            .find(|line| line.contains("#EXT-X-MOUFLON:"))
-        {
-            let parts: Vec<&str> = line.split(':').collect();
-            if parts.len() >= 4 {
-                return (Some(parts[2].to_string()), Some(parts[3].to_string()));
-            }
-        }
-        (None, None)
     }
 
     /// 解码 MOUFLON 加密数据
