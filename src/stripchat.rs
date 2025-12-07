@@ -502,12 +502,16 @@ impl StripChatRecorder {
 
         if !cookies.is_empty() {
             // 更新AppConfig中的cookies
-            let mut app_config = self.app_config.lock().await;
-            app_config.cookies = Some(cookies.clone());
+            {
+                let mut app_config = self.app_config.lock().await;
+                app_config.cookies = Some(cookies.clone());
+            }
 
-            // 如果有配置文件路径，保存到文件
+            // 如果有配置文件路径，只更新cookies字段到文件
             if let Some(config_path) = &self.config_file_path {
-                if let Err(e) = app_config.save_to_file(config_path) {
+                if let Err(e) =
+                    AppConfig::update_field(config_path, "cookies", serde_json::json!(cookies))
+                {
                     debug!("[{}] 保存配置文件失败: {}", self.config.username, e);
                 } else {
                     debug!(
@@ -1496,12 +1500,18 @@ impl StripChatRecorder {
                     && !cookies.is_empty()
                 {
                     // 更新AppConfig中的cookies
-                    let mut app_config = self.app_config.lock().await;
-                    app_config.cookies = Some(cookies);
+                    {
+                        let mut app_config = self.app_config.lock().await;
+                        app_config.cookies = Some(cookies.clone());
+                    }
 
-                    // 如果有配置文件路径，保存到文件
+                    // 如果有配置文件路径，只更新cookies字段到文件
                     if let Some(config_path) = &self.config_file_path {
-                        if let Err(e) = app_config.save_to_file(config_path) {
+                        if let Err(e) = AppConfig::update_field(
+                            config_path,
+                            "cookies",
+                            serde_json::json!(cookies),
+                        ) {
                             debug!("[{}] 保存配置文件失败: {}", self.config.username, e);
                         } else {
                             debug!(

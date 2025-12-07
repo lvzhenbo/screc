@@ -49,7 +49,7 @@ impl AppConfig {
         Ok(config)
     }
 
-    /// 保存配置到文件
+    /// 保存配置到文件（覆盖整个文件）
     pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let content = serde_json::to_string_pretty(self).context("无法序列化配置")?;
 
@@ -59,13 +59,45 @@ impl AppConfig {
         Ok(())
     }
 
+    /// 更新配置文件中的指定字段（只修改指定字段，保留其他字段）
+    pub fn update_field<P: AsRef<Path>>(
+        path: P,
+        field: &str,
+        value: serde_json::Value,
+    ) -> Result<()> {
+        let path = path.as_ref();
+
+        // 读取现有配置文件内容（如果存在）
+        let mut existing: serde_json::Value = if path.exists() {
+            let content = std::fs::read_to_string(path)
+                .with_context(|| format!("无法读取配置文件: {}", path.display()))?;
+            serde_json::from_str(&content)
+                .with_context(|| format!("无法解析配置文件: {}", path.display()))?
+        } else {
+            serde_json::json!({})
+        };
+
+        // 更新指定字段
+        if let Some(obj) = existing.as_object_mut() {
+            obj.insert(field.to_string(), value);
+        }
+
+        // 写入配置
+        let content = serde_json::to_string_pretty(&existing).context("无法序列化配置")?;
+        std::fs::write(path, content)
+            .with_context(|| format!("无法写入配置文件: {}", path.display()))?;
+
+        Ok(())
+    }
+
     /// 获取默认配置文件路径
     pub fn get_default_config_path() -> PathBuf {
         // 尝试获取程序所在目录
         if let Ok(exe_path) = std::env::current_exe()
-            && let Some(exe_dir) = exe_path.parent() {
-                return exe_dir.join("config.json");
-            }
+            && let Some(exe_dir) = exe_path.parent()
+        {
+            return exe_dir.join("config.json");
+        }
 
         // 如果获取失败，使用当前工作目录
         PathBuf::from("config.json")
@@ -169,9 +201,10 @@ impl AppConfig {
 
         // 尝试获取程序所在目录
         if let Ok(exe_path) = std::env::current_exe()
-            && let Some(exe_dir) = exe_path.parent() {
-                return exe_dir.join(&log_dir).join(filename);
-            }
+            && let Some(exe_dir) = exe_path.parent()
+        {
+            return exe_dir.join(&log_dir).join(filename);
+        }
 
         // 如果获取失败，使用当前工作目录的logs文件夹
         PathBuf::from(&log_dir).join(filename)

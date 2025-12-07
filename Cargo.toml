@@ -22,7 +22,7 @@ m3u8-rs = "6.0"
 url = "2.5.7"
 chrono = { version = "0.4.42", features = ["serde"] }
 anyhow = "1.0.100"
-log = "0.4.28"
+log = "0.4.29"
 fern = "0.7.1"
 colored = "3.0"
 clap = { version = "4.5.53", features = ["derive"] }
