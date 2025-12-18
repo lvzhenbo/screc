@@ -26,7 +26,6 @@ log = "0.4.29"
 fern = "0.7.1"
 colored = "3.0"
 clap = { version = "4.5.53", features = ["derive"] }
-regex = "1.12.2"
 rand = "0.9.2"
 
 # 二进制大小优化配置

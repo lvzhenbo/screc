@@ -2,7 +2,6 @@ use anyhow::{Result, anyhow};
 use base64::{Engine as _, engine::general_purpose};
 use chrono::Local;
 use log::{debug, error, info, warn};
-use regex::Regex;
 use reqwest::{
     Client,
     cookie::{CookieStore, Jar},
@@ -79,37 +78,6 @@ struct PlaylistVariant {
     resolution: (u32, u32), // 分辨率 (宽度, 高度)
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct StaticConfig {
-    features: Features,
-    #[serde(rename = "featuresV2")]
-    features_v2: FeaturesV2,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct Features {
-    #[serde(rename = "MMPExternalSourceOrigin")]
-    mmp_external_source_origin: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct FeaturesV2 {
-    #[serde(rename = "playerModuleExternalLoading")]
-    player_module_external_loading: PlayerModuleExternalLoading,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct PlayerModuleExternalLoading {
-    #[serde(rename = "mmpVersion")]
-    mmp_version: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct StaticData {
-    #[serde(rename = "static")]
-    static_config: StaticConfig,
-}
-
 pub struct StripChatRecorder {
     config: Config,                                          // 配置
     app_config: Arc<Mutex<AppConfig>>,                       // 全局配置
@@ -122,9 +90,7 @@ pub struct StripChatRecorder {
     pkey: Option<String>,                                    // PKEY参数
     status: StreamStatus,                                    // 流状态
     shutdown_rx: Option<broadcast::Receiver<()>>,            // 关闭信号接收器
-    static_data: Option<StaticConfig>,                       // StripChat静态配置数据
     mouflon_keys: std::collections::HashMap<String, String>, // MOUFLON密钥缓存
-    doppio_js_content: Option<String>,                       // doppio.js内容缓存
 }
 
 impl StripChatRecorder {
@@ -154,17 +120,13 @@ impl StripChatRecorder {
             config.cookies.as_deref(),
         )?;
 
-        // 初始化 MOUFLON 密钥映射
-        // 注意：pkey 不是解密密钥，而是密钥的 ID
-        // 需要通过此映射查找实际的解密密钥
-        let mut mouflon_keys = std::collections::HashMap::new();
-        // 已知的密钥映射（从 doppio.js 的 ns 对象中提取）
-        mouflon_keys.insert(
+        // 初始化已知的 MOUFLON 密钥映射
+        let mouflon_keys = std::collections::HashMap::from([(
             "Zeechoej4aleeshi".to_string(),
             "ubahjae7goPoodi6".to_string(),
-        );
+        )]);
 
-        let mut instance = Self {
+        let instance = Self {
             config,
             app_config: app_config.clone(),
             config_file_path,
@@ -176,16 +138,8 @@ impl StripChatRecorder {
             pkey: None,
             status: StreamStatus::Unknown,
             shutdown_rx: None,
-            static_data: None,
             mouflon_keys,
-            doppio_js_content: None,
         };
-
-        // 初始化静态数据
-        instance.initialize_static_data().await?;
-
-        // 从 doppio.js 提取更多密钥映射（如果可用）
-        instance.extract_mouflon_keys_from_doppio();
 
         // 根据cookie来源处理初始化
         match instance.cookie_source {
@@ -205,206 +159,6 @@ impl StripChatRecorder {
         }
 
         Ok(instance)
-    }
-
-    /// 初始化StripChat静态数据
-    async fn initialize_static_data(&mut self) -> Result<()> {
-        debug!("[{}] 正在初始化StripChat静态数据", self.config.username);
-
-        // 获取静态配置数据
-        let static_response = self
-            .client
-            .get("https://hu.stripchat.com/api/front/v3/config/static")
-            .send()
-            .await?;
-
-        if !static_response.status().is_success() {
-            return Err(anyhow!(
-                "获取StripChat静态数据失败: {}",
-                static_response.status()
-            ));
-        }
-
-        let static_data: StaticData = static_response.json().await?;
-        let static_config = static_data.static_config;
-
-        debug!(
-            "[{}] 获取到MMP配置: origin={}, version={}",
-            self.config.username,
-            static_config.features.mmp_external_source_origin,
-            static_config
-                .features_v2
-                .player_module_external_loading
-                .mmp_version
-        );
-
-        // 获取main.js
-        let mmp_base = format!(
-            "{}/v{}",
-            static_config.features.mmp_external_source_origin,
-            static_config
-                .features_v2
-                .player_module_external_loading
-                .mmp_version
-        );
-
-        let main_js_url = format!("{}/main.js", mmp_base);
-        let main_js_response = self.client.get(&main_js_url).send().await?;
-
-        if !main_js_response.status().is_success() {
-            return Err(anyhow!("获取main.js失败: {}", main_js_response.status()));
-        }
-
-        let main_js_content = main_js_response.text().await?;
-
-        // 从main.js中提取doppio.js文件名
-        // 新格式使用webpack代码分割: chunk-Doppio-<hash>.js
-        // 需要从 {376:"Doppio",...} 和 {376:"<hash>",...} 中提取
-        let doppio_js_name = self.extract_doppio_chunk_name(&main_js_content)?;
-        let doppio_js_url = format!("{}/{}", mmp_base, doppio_js_name);
-
-        debug!(
-            "[{}] 正在获取doppio.js: {}",
-            self.config.username, doppio_js_url
-        );
-
-        let doppio_js_response = self.client.get(&doppio_js_url).send().await?;
-        if !doppio_js_response.status().is_success() {
-            return Err(anyhow!(
-                "获取doppio.js失败: {}",
-                doppio_js_response.status()
-            ));
-        }
-
-        let doppio_js_content = doppio_js_response.text().await?;
-
-        // 缓存内容
-        self.static_data = Some(static_config);
-        self.doppio_js_content = Some(doppio_js_content);
-
-        debug!("[{}] 静态数据初始化完成", self.config.username);
-
-        Ok(())
-    }
-
-    /// 从main.js中提取Doppio chunk文件名
-    /// 新版本webpack格式: chunk-Doppio-<hash>.js
-    fn extract_doppio_chunk_name(&self, main_js_content: &str) -> Result<String> {
-        // 方法1: 尝试匹配新的webpack代码分割格式
-        // 格式: n.u=e=>"chunk-"+({358:"Native",376:"Doppio",...}[e]||e)+"-"+{...,376:"hash",...}[e]+".js"
-
-        // 首先找到chunk名称映射，提取Doppio对应的chunk ID
-        // 匹配 {数字:"Doppio"} 格式
-        let chunk_id_regex = Regex::new(r#"\{[^}]*?(\d+)\s*:\s*"Doppio"[^}]*?\}"#).unwrap();
-
-        if let Some(chunk_captures) = chunk_id_regex.captures(main_js_content) {
-            let chunk_id = &chunk_captures[1];
-            debug!(
-                "[{}] 找到Doppio chunk ID: {}",
-                self.config.username, chunk_id
-            );
-
-            // 在整个内容中查找对应chunk ID的hash
-            // 查找包含该chunk ID和hash的映射
-            let hash_pattern = format!(r#"{}:"([a-f0-9]{{20}})""#, chunk_id);
-            let specific_hash_regex = Regex::new(&hash_pattern).unwrap();
-
-            // 需要找到hash映射表，格式类似: {0:"hash1",376:"hash2",...}
-            // 通常在 n.u=e=> 附近
-            if let Some(hash_captures) = specific_hash_regex.captures(main_js_content) {
-                let hash = &hash_captures[1];
-                let doppio_filename = format!("chunk-Doppio-{}.js", hash);
-                debug!(
-                    "[{}] 构建Doppio文件名: {}",
-                    self.config.username, doppio_filename
-                );
-                return Ok(doppio_filename);
-            }
-        }
-
-        // 方法2: 尝试旧格式 require("./...Doppio...js")
-        if let Some(captures) = Regex::new(r#"require\("\./([^"]*Doppio[^"]*\.js)"\)"#)
-            .unwrap()
-            .captures(main_js_content)
-        {
-            let doppio_filename = captures[1].to_string();
-            debug!(
-                "[{}] 使用旧格式找到Doppio文件名: {}",
-                self.config.username, doppio_filename
-            );
-            return Ok(doppio_filename);
-        }
-
-        // 方法3: 直接搜索chunk-Doppio-xxx.js格式
-        if let Some(captures) = Regex::new(r#"chunk-Doppio-([a-f0-9]+)\.js"#)
-            .unwrap()
-            .captures(main_js_content)
-        {
-            let hash = &captures[1];
-            let doppio_filename = format!("chunk-Doppio-{}.js", hash);
-            debug!(
-                "[{}] 直接匹配到Doppio文件名: {}",
-                self.config.username, doppio_filename
-            );
-            return Ok(doppio_filename);
-        }
-
-        Err(anyhow!("无法从main.js中提取doppio.js文件名"))
-    }
-
-    /// 从 doppio.js 中提取 MOUFLON 密钥映射 (ns 对象)
-    ///
-    /// doppio.js 中包含一个名为 `ns` 的对象，它存储了 pkey 到实际解密密钥的映射。
-    /// 例如: ns = {"Zeechoej4aleeshi": "ubahjae7goPoodi6"}
-    ///
-    /// 由于代码是高度混淆的，我们尝试多种方法提取：
-    /// 1. 正则表达式匹配简单的对象字面量
-    /// 2. 搜索已知的密钥模式
-    fn extract_mouflon_keys_from_doppio(&mut self) {
-        let doppio_content = match &self.doppio_js_content {
-            Some(content) => content,
-            None => {
-                debug!(
-                    "[{}] doppio.js 内容不可用，跳过密钥提取",
-                    self.config.username
-                );
-                return;
-            }
-        };
-
-        debug!(
-            "[{}] 开始从 doppio.js 提取 MOUFLON 密钥映射",
-            self.config.username
-        );
-
-        // 方法1: 尝试匹配简单的对象字面量格式
-        // 格式: {"key1":"value1","key2":"value2"} 或 {key1:"value1",key2:"value2"}
-        let key_value_regex =
-            Regex::new(r#""([A-Za-z0-9]{16})"\s*:\s*"([A-Za-z0-9]{16})""#).unwrap();
-
-        for captures in key_value_regex.captures_iter(doppio_content) {
-            let pkey = captures[1].to_string();
-            let actual_key = captures[2].to_string();
-
-            // 验证这看起来像一个合理的密钥对
-            if !self.mouflon_keys.contains_key(&pkey) {
-                debug!(
-                    "[{}] 从 doppio.js 提取到密钥映射: {} -> {}",
-                    self.config.username, pkey, actual_key
-                );
-                self.mouflon_keys.insert(pkey, actual_key);
-            }
-        }
-
-        // 方法2: 搜索 ss() 函数返回的字符串数组中的密钥
-        // 这些字符串是 base64 编码的，解码后可能包含密钥
-        // 由于混淆太复杂，这里只记录日志，实际密钥已在初始化时硬编码
-
-        debug!(
-            "[{}] MOUFLON 密钥映射提取完成，共 {} 个密钥",
-            self.config.username,
-            self.mouflon_keys.len()
-        );
     }
 
     /// 生成随机uniq参数
@@ -1036,14 +790,8 @@ impl StripChatRecorder {
 
         let username = self.config.username.clone();
         let mouflon_keys = self.mouflon_keys.clone();
-        let doppio_js_content = self.doppio_js_content.clone();
         let processor = move |content: &str| {
-            Self::m3u_decoder_with_dynamic_keys(
-                content,
-                &username,
-                &mouflon_keys,
-                &doppio_js_content,
-            )
+            Self::m3u_decoder_with_dynamic_keys(content, &username, &mouflon_keys)
         };
         downloader
             .download_hls_stream(&video_url, &output_path, Some(&processor))
@@ -1285,13 +1033,12 @@ impl StripChatRecorder {
         content: &str,
         username: &str,
         mouflon_keys: &HashMap<String, String>,
-        doppio_js_content: &Option<String>,
     ) -> String {
         debug!("[{}] M3U8 解码器开始处理", username);
 
         // 使用改进的提取函数，直接获取解密密钥
         let (_psch, _pkey, decryption_key) =
-            Self::extract_mouflon_from_m3u_with_key(content, mouflon_keys, doppio_js_content);
+            Self::extract_mouflon_from_m3u_with_key(content, mouflon_keys);
 
         let decryption_key = match decryption_key {
             Some(key) => key,
@@ -1349,7 +1096,6 @@ impl StripChatRecorder {
     fn extract_mouflon_from_m3u_with_key(
         content: &str,
         mouflon_keys: &HashMap<String, String>,
-        _doppio_js_content: &Option<String>,
     ) -> (Option<String>, Option<String>, Option<String>) {
         let needle = "#EXT-X-MOUFLON:PSCH:";
         let mut start = 0;
