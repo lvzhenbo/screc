@@ -121,10 +121,16 @@ impl StripChatRecorder {
         )?;
 
         // 初始化已知的 MOUFLON 密钥映射
-        let mouflon_keys = std::collections::HashMap::from([(
-            "Zeechoej4aleeshi".to_string(),
-            "ubahjae7goPoodi6".to_string(),
-        )]);
+        let mouflon_keys = std::collections::HashMap::from([
+            (
+                "Zeechoej4aleeshi".to_string(),
+                "ubahjae7goPoodi6".to_string(),
+            ),
+            (
+                "Ook7quaiNgiyuhai".to_string(),
+                "8iPRUU0AnxoOSif9".to_string(),
+            ),
+        ]);
 
         let instance = Self {
             config,
