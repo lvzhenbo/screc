@@ -843,19 +843,27 @@ impl StripChatRecorder {
             .choose(&mut rand::rng())
             .unwrap_or(&"doppiocdn.com");
 
-        // 构建基础URL
-        let mut master_url = format!(
+        // 构建基础URL并强制使用 psch=v2 和 pkey=Zeechoej4aleeshi（避免广告播放列表）
+        // 参考: https://github.com/lossless1024/StreaMonitor/issues/310
+        let mut master_url = Url::parse(&format!(
             "https://edge-hls.{}/hls/{}/master/{}_auto.m3u8",
             selected_host, stream_name, stream_name
-        );
+        ))?;
+
+        master_url
+            .query_pairs_mut()
+            .append_pair("psch", "v2")
+            .append_pair("pkey", "Zeechoej4aleeshi");
 
         // 如果有modelToken且不为空，添加到URL参数中（参考JS的buildM3u8Url逻辑）
         if let Some(token) = model_token {
             if !token.is_empty() {
-                master_url.push_str(&format!("?aclAuth={}", token));
+                master_url.query_pairs_mut().append_pair("aclAuth", token);
                 debug!("[{}] 使用modelToken添加认证参数到URL", self.config.username);
             }
         }
+
+        let master_url = master_url.to_string();
 
         debug!("[{}] 获取主播放列表: {}", self.config.username, master_url);
 
@@ -960,13 +968,11 @@ impl StripChatRecorder {
                     base.join(&stream.uri)?.to_string()
                 };
 
-                // 如果可用，添加 MOUFLON 参数
-                if let (Some(psch), Some(pkey)) = (&self.psch, &self.pkey) {
-                    if url.contains('?') {
-                        url = format!("{}&psch={}&pkey={}", url, psch, pkey);
-                    } else {
-                        url = format!("{}?psch={}&pkey={}", url, psch, pkey);
-                    }
+                // 强制使用 Zeechoej4aleeshi 密钥（避免服务器返回其他密钥的加密内容）
+                if url.contains('?') {
+                    url = format!("{}&psch=v2&pkey=Zeechoej4aleeshi", url);
+                } else {
+                    url = format!("{}?psch=v2&pkey=Zeechoej4aleeshi", url);
                 }
 
                 variants.push(PlaylistVariant { url, resolution });
@@ -1060,29 +1066,66 @@ impl StripChatRecorder {
         let mut decoded = Vec::new();
         let lines: Vec<&str> = content.lines().collect();
         let mut i = 0;
+        let mut last_decoded_uri: Option<String> = None;
 
         while i < lines.len() {
             let line = lines[i];
 
+            if let Some(uri_line) = line.strip_prefix("#EXT-X-MOUFLON:URI:") {
+                if let Some(encoded_part) = uri_line.rsplit('_').nth(1) {
+                    match Self::decode_mouflon(encoded_part, &decryption_key) {
+                        Ok(decoded_part) => {
+                            last_decoded_uri = Some(uri_line.replace(encoded_part, &decoded_part));
+                            debug!(
+                                "[{}] 成功解码 MOUFLON URI (行 {}): {}",
+                                username,
+                                i,
+                                last_decoded_uri.as_ref().unwrap()
+                            );
+                        }
+                        Err(e) => {
+                            debug!("[{}] MOUFLON URI 解密失败 (行 {}): {}", username, i, e);
+                            last_decoded_uri = None;
+                        }
+                    }
+                } else {
+                    debug!(
+                        "[{}] MOUFLON URI 行格式异常 (行 {}): {}",
+                        username, i, uri_line
+                    );
+                    last_decoded_uri = None;
+                }
+
+                i += 1;
+                continue;
+            }
+
             if let Some(encrypted_data) = line.strip_prefix("#EXT-X-MOUFLON:FILE:") {
-                debug!("[{}] 在索引 {} 发现 MOUFLON FILE 行", username, i);
+                debug!("[{}] 在索引 {} 发现旧版 MOUFLON FILE 行", username, i);
 
                 match Self::decode_mouflon(encrypted_data, &decryption_key) {
                     Ok(decrypted) => {
                         debug!("[{}] 解密成功: {}", username, decrypted);
 
-                        // Process the next line if it exists
                         if i + 1 < lines.len() {
                             let original_line = lines[i + 1];
                             let next_line = original_line.replace("media.mp4", &decrypted);
                             decoded.push(next_line);
-                            i += 2; // Skip both current line and next line
+                            i += 2;
                             continue;
                         }
                     }
                     Err(e) => {
                         debug!("[{}] MOUFLON 解密失败: {}", username, e);
                     }
+                }
+            }
+
+            if line.ends_with("media.mp4") {
+                if let Some(uri) = last_decoded_uri.take() {
+                    decoded.push(uri);
+                    i += 1;
+                    continue;
                 }
             }
 
@@ -1150,37 +1193,44 @@ impl StripChatRecorder {
 
     /// 解码 MOUFLON 加密数据
     fn decode_mouflon(encrypted_b64: &str, key: &str) -> Result<String> {
+        fn decode_inner(encrypted_b64: &str, key: &str, reverse_first: bool) -> Result<String> {
+            let mut working: String = if reverse_first {
+                encrypted_b64.chars().rev().collect()
+            } else {
+                encrypted_b64.to_string()
+            };
+
+            while working.len() % 4 != 0 {
+                working.push('=');
+            }
+
+            let encrypted_data = general_purpose::STANDARD
+                .decode(working.as_bytes())
+                .map_err(|e| anyhow!("Base64 解码失败: {}", e))?;
+
+            let mut hasher = Sha256::new();
+            hasher.update(key.as_bytes());
+            let hash_bytes = hasher.finalize();
+
+            let decrypted_bytes: Vec<u8> = encrypted_data
+                .iter()
+                .zip(hash_bytes.iter().cycle())
+                .map(|(&cipher_byte, &key_byte)| cipher_byte ^ key_byte)
+                .collect();
+
+            String::from_utf8(decrypted_bytes).map_err(|e| anyhow!("UTF-8 解码错误: {}", e))
+        }
+
         debug!(
             "尝试解码 MOUFLON: 长度={}, 数据={}",
             encrypted_b64.len(),
             encrypted_b64
         );
 
-        // 如需要，正确添加 base64 填充
-        let mut padded = encrypted_b64.to_string();
-        while !padded.len().is_multiple_of(4) {
-            padded.push('=');
-        }
-
-        debug!("填充后的 base64: 长度={}, 数据={}", padded.len(), padded);
-        let encrypted_data = general_purpose::STANDARD
-            .decode(&padded)
-            .map_err(|e| anyhow!("Base64 解码失败: {}", e))?;
-
-        // 从密钥生成哈希
-        let mut hasher = Sha256::new();
-        hasher.update(key.as_bytes());
-        let hash_bytes = hasher.finalize();
-
-        // 解密
-        let mut decrypted_bytes = Vec::new();
-        for (i, &cipher_byte) in encrypted_data.iter().enumerate() {
-            let key_byte = hash_bytes[i % hash_bytes.len()];
-            let decrypted_byte = cipher_byte ^ key_byte;
-            decrypted_bytes.push(decrypted_byte);
-        }
-
-        String::from_utf8(decrypted_bytes).map_err(|e| anyhow!("UTF-8 解码错误: {}", e))
+        decode_inner(encrypted_b64, key, true).or_else(|err| {
+            debug!("MOUFLON 反向解码失败，尝试旧版算法: {}", err);
+            decode_inner(encrypted_b64, key, false)
+        })
     }
 
     /// 刷新 cookies（仅访问网站刷新，不保存到配置）
