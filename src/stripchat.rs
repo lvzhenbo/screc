@@ -55,6 +55,8 @@ struct UserInfoWrapper {
 
 #[derive(Debug, Clone, Deserialize)]
 struct ModelInfo {
+    #[allow(dead_code)]
+    id: Option<i64>, // 模特 ID
     status: String, // 状态
     #[serde(rename = "isDeleted")]
     is_deleted: Option<bool>, // 是否已删除
@@ -66,8 +68,9 @@ struct CamInfo {
     is_cam_available: bool, // 摄像头是否可用
     #[serde(rename = "isCamActive")]
     is_cam_active: bool, // 摄像头是否激活
+    #[allow(dead_code)]
     #[serde(rename = "streamName")]
-    stream_name: String, // 流名称
+    stream_name: String, // 流名称（保留用于反序列化，URL 构建改用 model_id）
     #[serde(rename = "modelToken")]
     model_token: Option<String>, // 模特令牌（用于私人秀等场景）
 }
@@ -120,15 +123,20 @@ impl StripChatRecorder {
             config.cookies.as_deref(),
         )?;
 
-        // 初始化已知的 MOUFLON 密钥映射
+        // 初始化已知的 MOUFLON 密钥映射（参考 cbstream 项目）
+        // pkey（密钥ID）-> actual_key（实际解密密钥）
         let mouflon_keys = std::collections::HashMap::from([
             (
                 "Zeechoej4aleeshi".to_string(),
                 "ubahjae7goPoodi6".to_string(),
             ),
             (
+                "Zokee2OhPh9kugh4".to_string(),
+                "Quean4cai9boJa5a".to_string(),
+            ),
+            (
                 "Ook7quaiNgiyuhai".to_string(),
-                "8iPRUU0AnxoOSif9".to_string(),
+                "EQueeGh2kaewa3ch".to_string(),
             ),
         ]);
 
@@ -823,7 +831,35 @@ impl StripChatRecorder {
         Ok(selected_variant.url)
     }
 
-    /// 获取播放列表版本
+    /// 获取 HLS CDN 前缀（参考 cbstream 项目：从 API 动态获取）
+    async fn get_hls_prefix(&self) -> Result<String> {
+        let url = "https://stripchat.com/api/front/models?primaryTag=girls";
+        debug!("[{}] 获取 HLS CDN 前缀: {}", self.config.username, url);
+
+        let response = self.client.get(url).send().await?;
+        if !response.status().is_success() {
+            return Err(anyhow!("获取 HLS 前缀失败: {}", response.status()));
+        }
+
+        let json: serde_json::Value = response.json().await?;
+        let ref_hls = json["models"]
+            .as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|m| m["hlsPlaylist"].as_str())
+            .ok_or_else(|| anyhow!("无法从 API 响应中提取 hlsPlaylist"))?;
+
+        // 提取前缀：取 URL 前 3 段（如 "https://edge-hls.doppiocdn.com"）
+        let parts: Vec<&str> = ref_hls.split('/').collect();
+        let hls_prefix = parts
+            .get(..3)
+            .ok_or_else(|| anyhow!("hlsPlaylist URL 格式异常: {}", ref_hls))?
+            .join("/");
+
+        debug!("[{}] HLS CDN 前缀: {}", self.config.username, hls_prefix);
+        Ok(hls_prefix)
+    }
+
+    /// 获取播放列表版本（参考 cbstream 项目：使用 model_id 和动态 CDN 前缀）
     async fn get_playlist_variants(&mut self) -> Result<Vec<PlaylistVariant>> {
         let Some(ref last_info) = self.last_info else {
             return Err(anyhow!("没有可用的直播信息"));
@@ -833,37 +869,48 @@ impl StripChatRecorder {
             return Err(anyhow!("没有可用的摄像头信息"));
         };
 
-        let stream_name = &cam.stream_name;
-        let model_token = &cam.model_token;
+        let model_token = cam.model_token.clone();
 
-        // 随机选择CDN主机 (模仿参考实现)
-        use rand::prelude::IndexedRandom;
-        let cdn_hosts = ["doppiocdn.org", "doppiocdn.com", "doppiocdn.net"];
-        let selected_host = cdn_hosts
-            .choose(&mut rand::rng())
-            .unwrap_or(&"doppiocdn.com");
+        // 获取 model_id（参考 cbstream: json["user"]["user"]["id"]）
+        let model_id = last_info
+            .user
+            .as_ref()
+            .and_then(|u| u.user.id)
+            .or_else(|| last_info.model.as_ref().and_then(|m| m.id))
+            .ok_or_else(|| anyhow!("无法获取模特 ID"))?;
 
-        // 构建基础URL并强制使用 psch=v2 和 pkey=Zeechoej4aleeshi（避免广告播放列表）
-        // 参考: https://github.com/lossless1024/StreaMonitor/issues/310
-        let mut master_url = Url::parse(&format!(
-            "https://edge-hls.{}/hls/{}/master/{}_auto.m3u8",
-            selected_host, stream_name, stream_name
-        ))?;
-
-        master_url
-            .query_pairs_mut()
-            .append_pair("psch", "v2")
-            .append_pair("pkey", "Zeechoej4aleeshi");
-
-        // 如果有modelToken且不为空，添加到URL参数中（参考JS的buildM3u8Url逻辑）
-        if let Some(token) = model_token {
-            if !token.is_empty() {
-                master_url.query_pairs_mut().append_pair("aclAuth", token);
-                debug!("[{}] 使用modelToken添加认证参数到URL", self.config.username);
+        // 动态获取 HLS CDN 前缀（参考 cbstream 项目）
+        let hls_prefix = match self.get_hls_prefix().await {
+            Ok(prefix) => prefix,
+            Err(e) => {
+                // 降级使用硬编码的 CDN 主机
+                warn!(
+                    "[{}] 获取 HLS 前缀失败，使用备用 CDN: {}",
+                    self.config.username, e
+                );
+                use rand::prelude::IndexedRandom;
+                let cdn_hosts = ["doppiocdn.org", "doppiocdn.com", "doppiocdn.net"];
+                let selected_host = cdn_hosts
+                    .choose(&mut rand::rng())
+                    .unwrap_or(&"doppiocdn.com");
+                format!("https://edge-hls.{}", selected_host)
             }
-        }
+        };
 
-        let master_url = master_url.to_string();
+        // 构建主播放列表 URL（参考 cbstream: {hls_prefix}/hls/{model_id}/master/{model_id}.m3u8）
+        let master_url = format!("{}/hls/{}/master/{}.m3u8", hls_prefix, model_id, model_id);
+
+        // 如果有 modelToken 且不为空，添加到 URL 参数中
+        let master_url = if let Some(ref token) = model_token {
+            if !token.is_empty() {
+                debug!("[{}] 使用modelToken添加认证参数到URL", self.config.username);
+                format!("{}?aclAuth={}", master_url, token)
+            } else {
+                master_url
+            }
+        } else {
+            master_url
+        };
 
         debug!("[{}] 获取主播放列表: {}", self.config.username, master_url);
 
@@ -946,8 +993,30 @@ impl StripChatRecorder {
         }
     }
 
-    /// 解析主播放列表
+    /// 解析主播放列表（参考 cbstream：从 MOUFLON 行提取 psch/pkey 并附加到变体 URL）
     fn parse_master_playlist(&self, content: &str, base_url: &str) -> Result<Vec<PlaylistVariant>> {
+        // 从主播放列表中提取 MOUFLON psch/pkey（参考 cbstream：使用最后一个 MOUFLON 行）
+        let mut mouflon_psch: Option<String> = None;
+        let mut mouflon_pkey: Option<String> = None;
+
+        if content.contains("EXT-X-MOUFLON") {
+            for line in content.lines().rev() {
+                if !line.contains("EXT-X-MOUFLON") {
+                    continue;
+                }
+                let segments: Vec<&str> = line.split(':').collect();
+                if segments.len() >= 4 {
+                    mouflon_psch = Some(segments[2].to_string());
+                    mouflon_pkey = Some(segments[3].to_string());
+                    debug!(
+                        "[{}] 从主播放列表提取 MOUFLON: psch={}, pkey={}",
+                        self.config.username, segments[2], segments[3]
+                    );
+                    break;
+                }
+            }
+        }
+
         let playlist = m3u8_rs::parse_playlist_res(content.as_bytes())
             .map_err(|e| anyhow!("解析主播放列表失败: {:?}", e))?;
 
@@ -968,11 +1037,10 @@ impl StripChatRecorder {
                     base.join(&stream.uri)?.to_string()
                 };
 
-                // 强制使用 Zeechoej4aleeshi 密钥（避免服务器返回其他密钥的加密内容）
-                if url.contains('?') {
-                    url = format!("{}&psch=v2&pkey=Zeechoej4aleeshi", url);
-                } else {
-                    url = format!("{}?psch=v2&pkey=Zeechoej4aleeshi", url);
+                // 如果存在 MOUFLON 参数，附加到变体 URL（参考 cbstream）
+                if let (Some(psch), Some(pkey)) = (&mouflon_psch, &mouflon_pkey) {
+                    let separator = if url.contains('?') { "&" } else { "?" };
+                    url = format!("{}{}&psch={}&pkey={}", url, separator, psch, pkey);
                 }
 
                 variants.push(PlaylistVariant { url, resolution });
@@ -1040,7 +1108,7 @@ impl StripChatRecorder {
         path
     }
 
-    // M3U8 解密函数 - 使用动态密钥提取
+    // M3U8 解密函数 - 参考 cbstream 项目的正则表达式方法
     fn m3u_decoder_with_dynamic_keys(
         content: &str,
         username: &str,
@@ -1063,6 +1131,10 @@ impl StripChatRecorder {
             }
         };
 
+        // 参考 cbstream 使用正则提取加密字符串
+        // 匹配模式: _ENCRYPTED_123.mp4 或 _ENCRYPTED_123_part1.mp4
+        let re = regex::Regex::new(r"_([^_]+)_(\d+(?:_part\d+)?)\.mp4(?:[?#].*)?$").unwrap();
+
         let mut decoded = Vec::new();
         let lines: Vec<&str> = content.lines().collect();
         let mut i = 0;
@@ -1071,57 +1143,50 @@ impl StripChatRecorder {
         while i < lines.len() {
             let line = lines[i];
 
-            if let Some(uri_line) = line.strip_prefix("#EXT-X-MOUFLON:URI:") {
-                if let Some(encoded_part) = uri_line.rsplit('_').nth(1) {
-                    match Self::decode_mouflon(encoded_part, &decryption_key) {
-                        Ok(decoded_part) => {
-                            last_decoded_uri = Some(uri_line.replace(encoded_part, &decoded_part));
-                            debug!(
-                                "[{}] 成功解码 MOUFLON URI (行 {}): {}",
-                                username,
-                                i,
-                                last_decoded_uri.as_ref().unwrap()
-                            );
+            // 跳过 MOUFLON PSCH 行（密钥标识行）
+            if line.starts_with("#EXT-X-MOUFLON:PSCH:") {
+                i += 1;
+                continue;
+            }
+
+            // 处理 MOUFLON URI 行（参考 cbstream 的 URL 提取方式）
+            if line.contains("#EXT-X-MOUFLON:URI:") || line.contains("#EXT-X-MOUFLON:FILE:") {
+                // 参考 cbstream: mouflon.split(":").last() 获取 URL 部分
+                if let Some(last_part) = line.split(':').last() {
+                    let encoded_url = format!("https:{}", last_part);
+
+                    // 使用正则提取加密字符串（参考 cbstream）
+                    if let Some(captures) = re.captures(&encoded_url) {
+                        if let Some(encrypted_match) = captures.get(1) {
+                            let encrypted_str = encrypted_match.as_str();
+
+                            match Self::decode_mouflon(encrypted_str, &decryption_key) {
+                                Ok(decrypted) => {
+                                    let result_url = encoded_url.replace(encrypted_str, &decrypted);
+                                    last_decoded_uri = Some(result_url);
+                                    debug!("[{}] 成功解码 MOUFLON URI (行 {})", username, i);
+                                }
+                                Err(e) => {
+                                    debug!("[{}] MOUFLON URI 解密失败 (行 {}): {}", username, i, e);
+                                    last_decoded_uri = None;
+                                }
+                            }
                         }
-                        Err(e) => {
-                            debug!("[{}] MOUFLON URI 解密失败 (行 {}): {}", username, i, e);
-                            last_decoded_uri = None;
-                        }
+                    } else {
+                        debug!(
+                            "[{}] MOUFLON URI 正则匹配失败 (行 {}): {}",
+                            username, i, encoded_url
+                        );
+                        last_decoded_uri = None;
                     }
-                } else {
-                    debug!(
-                        "[{}] MOUFLON URI 行格式异常 (行 {}): {}",
-                        username, i, uri_line
-                    );
-                    last_decoded_uri = None;
                 }
 
                 i += 1;
                 continue;
             }
 
-            if let Some(encrypted_data) = line.strip_prefix("#EXT-X-MOUFLON:FILE:") {
-                debug!("[{}] 在索引 {} 发现旧版 MOUFLON FILE 行", username, i);
-
-                match Self::decode_mouflon(encrypted_data, &decryption_key) {
-                    Ok(decrypted) => {
-                        debug!("[{}] 解密成功: {}", username, decrypted);
-
-                        if i + 1 < lines.len() {
-                            let original_line = lines[i + 1];
-                            let next_line = original_line.replace("media.mp4", &decrypted);
-                            decoded.push(next_line);
-                            i += 2;
-                            continue;
-                        }
-                    }
-                    Err(e) => {
-                        debug!("[{}] MOUFLON 解密失败: {}", username, e);
-                    }
-                }
-            }
-
-            if line.ends_with("media.mp4") {
+            // 处理分片 URL 行：如果前一行是 MOUFLON，使用解密后的 URL 替换
+            if !line.is_empty() && !line.starts_with('#') {
                 if let Some(uri) = last_decoded_uri.take() {
                     decoded.push(uri);
                     i += 1;
