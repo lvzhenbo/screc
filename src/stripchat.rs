@@ -177,7 +177,7 @@ impl StripChatRecorder {
 
     /// 生成随机uniq参数
     fn generate_uniq() -> String {
-        use rand::Rng;
+        use rand::RngExt;
         let mut rng = rand::rng();
         let chars: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
         (0..16)
