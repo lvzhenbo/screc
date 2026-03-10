@@ -897,8 +897,11 @@ impl StripChatRecorder {
             }
         };
 
-        // 构建主播放列表 URL（参考 cbstream: {hls_prefix}/hls/{model_id}/master/{model_id}.m3u8）
-        let master_url = format!("{}/hls/{}/master/{}.m3u8", hls_prefix, model_id, model_id);
+        // 构建主播放列表 URL（参考 cbstream: {hls_prefix}/hls/{model_id}/master/{model_id}_auto.m3u8）
+        let master_url = format!(
+            "{}/hls/{}/master/{}_auto.m3u8",
+            hls_prefix, model_id, model_id
+        );
 
         // 如果有 modelToken 且不为空，添加到 URL 参数中
         let master_url = if let Some(ref token) = model_token {
