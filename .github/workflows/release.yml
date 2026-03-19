@@ -34,4 +34,3 @@ jobs:
           EXTRA_FILES: "README.md LICENSE"
           TOOLCHAIN_VERSION: stable
           MINIFY: true
-          PRE_BUILD: ".github/scripts/ci-prebuild.sh"

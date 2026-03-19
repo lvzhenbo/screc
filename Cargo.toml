@@ -10,7 +10,6 @@ path = "src/bin/screc.rs"
 [[bin]]
 name = "screc-gui"
 path = "src/bin/screc-gui.rs"
-required-features = ["gui"]
 
 [features]
 default = []

@@ -30,7 +30,6 @@ jobs:
           EXTRA_FILES: "README.md LICENSE"
           ARCHIVE_TYPES: "zip"
           TOOLCHAIN_VERSION: stable
-          PRE_BUILD: ".github/scripts/ci-prebuild.sh"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
