@@ -13,27 +13,46 @@ jobs:
       matrix:
         include:
           - target: x86_64-pc-windows-gnu
+            packages: "--package screc --package screc-gui"
+            deps: gcc-mingw-w64-x86-64
             archive: zip
             name: windows-x64
-            extra_args: "--features gui"
           - target: x86_64-unknown-linux-musl
+            packages: "--package screc"
+            deps: musl-tools
             archive: tar.gz
             name: linux-x64
-            extra_args: ""
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Compile and release
-        uses: rust-build/rust-build.action@v1.4.5
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.deps }}
+
+      - name: Setup Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          RUSTTARGET: ${{ matrix.target }}
-          ARCHIVE_TYPES: ${{ matrix.archive }}
-          ARCHIVE_NAME: screc-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }}
-          EXTRA_FILES: "README.md LICENSE"
-          TOOLCHAIN_VERSION: stable
-          MINIFY: true
-          CARGO_EXTRA_ARGS: ${{ matrix.extra_args }}
+          toolchain: stable
+          target: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} ${{ matrix.packages }}
+
+      - name: Package release
+        run: |
+          ARCHIVE_NAME="screc-${{ github.ref_name }}-${{ matrix.name }}"
+          mkdir -p "${ARCHIVE_NAME}"
+          cp README.md LICENSE "${ARCHIVE_NAME}/"
+          find target/${{ matrix.target }}/release -maxdepth 1 -type f \( -name "screc" -o -name "screc.exe" -o -name "screc-gui" -o -name "screc-gui.exe" \) -exec cp {} "${ARCHIVE_NAME}/" \;
+
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            zip -r "${ARCHIVE_NAME}.${{ matrix.archive }}" "${ARCHIVE_NAME}"
+          else
+            tar czf "${ARCHIVE_NAME}.${{ matrix.archive }}" "${ARCHIVE_NAME}"
+          fi
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: screc-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }}

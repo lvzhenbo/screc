@@ -16,9 +16,17 @@ use url::Url;
 
 use crate::config::{AppConfig, Config};
 use crate::downloader::HlsDownloader;
-#[cfg(feature = "gui")]
-use crate::shared_state::{ModelStreamStatus, SharedGuiState};
 use crate::utils::create_client;
+
+/// 录制器回调 trait，用于向外部（如 GUI）报告状态
+pub trait RecorderCallback: Send + Sync {
+    /// 直播状态变化
+    fn on_status_change(&self, username: &str, status: &StreamStatus);
+    /// 开始录制
+    fn on_recording_start(&self, username: &str, file_path: &str);
+    /// 停止录制
+    fn on_recording_stop(&self, username: &str);
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StreamStatus {
@@ -96,8 +104,7 @@ pub struct StripChatRecorder {
     status: StreamStatus,                                    // 流状态
     shutdown_rx: Option<broadcast::Receiver<()>>,            // 关闭信号接收器
     mouflon_keys: std::collections::HashMap<String, String>, // MOUFLON密钥缓存
-    #[cfg(feature = "gui")]
-    gui_state: Option<SharedGuiState>,                       // GUI共享状态
+    callback: Option<Arc<dyn RecorderCallback>>,             // 外部回调（如 GUI）
 }
 
 impl StripChatRecorder {
@@ -157,8 +164,7 @@ impl StripChatRecorder {
             status: StreamStatus::Unknown,
             shutdown_rx: None,
             mouflon_keys,
-            #[cfg(feature = "gui")]
-            gui_state: None,
+            callback: None,
         };
 
         // 根据cookie来源处理初始化
@@ -218,27 +224,15 @@ impl StripChatRecorder {
         self.shutdown_rx = Some(shutdown_rx);
     }
 
-    /// 设置 GUI 共享状态
-    #[cfg(feature = "gui")]
-    pub fn set_gui_state(&mut self, gui_state: SharedGuiState) {
-        self.gui_state = Some(gui_state);
+    /// 设置外部回调（如 GUI 状态报告）
+    pub fn set_callback(&mut self, callback: Arc<dyn RecorderCallback>) {
+        self.callback = Some(callback);
     }
 
-    /// 将 StreamStatus 映射并报告到 GUI
-    #[cfg(feature = "gui")]
-    fn report_status_to_gui(&self) {
-        if let Some(ref gs) = self.gui_state {
-            let model_status = match &self.status {
-                StreamStatus::Public => ModelStreamStatus::Public,
-                StreamStatus::Private => ModelStreamStatus::Private,
-                StreamStatus::Offline => ModelStreamStatus::Offline,
-                StreamStatus::LongOffline => ModelStreamStatus::LongOffline,
-                StreamStatus::Error => ModelStreamStatus::Error,
-                StreamStatus::Unknown => ModelStreamStatus::Unknown,
-                StreamStatus::NotExist => ModelStreamStatus::NotExist,
-                StreamStatus::Restricted => ModelStreamStatus::Restricted,
-            };
-            gs.update_status(&self.config.username, model_status);
+    /// 报告状态变化到外部回调
+    fn report_status(&self) {
+        if let Some(ref cb) = self.callback {
+            cb.on_status_change(&self.config.username, &self.status);
         }
     }
 
@@ -277,7 +271,7 @@ impl StripChatRecorder {
     async fn interruptible_sleep(&mut self, duration: tokio::time::Duration) -> bool {
         if let Some(ref mut shutdown_rx) = self.shutdown_rx {
             let mut shutdown_rx = shutdown_rx.resubscribe();
-            tokio::select! {
+            let result = tokio::select! {
                 _ = tokio::time::sleep(duration) => {
                     // 等待完成，检查一次关闭信号
                     self.check_shutdown_signal()
@@ -286,7 +280,8 @@ impl StripChatRecorder {
                     info!("等待期间收到关闭信号，停止 {} 的录制循环", self.config.username);
                     true
                 }
-            }
+            };
+            result
         } else {
             tokio::time::sleep(duration).await;
             false
@@ -430,8 +425,7 @@ impl StripChatRecorder {
             };
 
             self.status = status.clone();
-            #[cfg(feature = "gui")]
-            self.report_status_to_gui();
+            self.report_status();
 
             match self.status {
                 StreamStatus::Public => {
@@ -827,14 +821,9 @@ impl StripChatRecorder {
 
         info!("[{}] 录制到: {:?}", self.config.username, output_path);
 
-        // 通知 GUI 开始录制
-        #[cfg(feature = "gui")]
-        if let Some(ref gs) = self.gui_state {
-            gs.set_recording(
-                &self.config.username,
-                true,
-                Some(output_path.display().to_string()),
-            );
+        // 通知开始录制
+        if let Some(ref cb) = self.callback {
+            cb.on_recording_start(&self.config.username, &output_path.display().to_string());
         }
 
         let mut downloader = HlsDownloader::new(self.client.clone(), self.config.username.clone());
@@ -853,10 +842,9 @@ impl StripChatRecorder {
             .download_hls_stream(&video_url, &output_path, Some(&processor))
             .await;
 
-        // 通知 GUI 录制结束
-        #[cfg(feature = "gui")]
-        if let Some(ref gs) = self.gui_state {
-            gs.set_recording(&self.config.username, false, None);
+        // 通知录制结束
+        if let Some(ref cb) = self.callback {
+            cb.on_recording_stop(&self.config.username);
         }
 
         result

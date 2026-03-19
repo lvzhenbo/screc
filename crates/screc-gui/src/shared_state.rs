@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use crate::config::{AppConfig, ModelEntry};
+use screc_core::config::{AppConfig, ModelEntry};
 
 /// GUI → 录制管理器的命令
 pub enum ModelCommand {

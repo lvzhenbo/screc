@@ -1,0 +1,24 @@
+[package]
+name = "screc"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "screc"
+path = "src/main.rs"
+
+[dependencies]
+screc-core = { path = "../screc-core" }
+tokio = { version = "1.50.0", features = [
+    "rt-multi-thread",
+    "macros",
+    "time",
+    "sync",
+    "signal",
+] }
+anyhow = "1.0.102"
+clap = { version = "4.6.0", features = ["derive"] }
+colored = "3.1.1"
+log = "0.4.29"
+fern = "0.7.1"
+chrono = "0.4.44"
