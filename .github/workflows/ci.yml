@@ -15,9 +15,7 @@ jobs:
       matrix:
         include:
           - target: x86_64-pc-windows-gnu
-            extra_args: "--features gui"
           - target: x86_64-unknown-linux-musl
-            extra_args: ""
 
     steps:
       - name: Checkout repository
@@ -32,7 +30,6 @@ jobs:
           EXTRA_FILES: "README.md LICENSE"
           ARCHIVE_TYPES: "zip"
           TOOLCHAIN_VERSION: stable
-          CARGO_EXTRA_ARGS: ${{ matrix.extra_args }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
