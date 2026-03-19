@@ -247,9 +247,10 @@ impl HlsDownloader {
 
         // 清理临时文件
         if temp_path.exists()
-            && let Err(e) = tokio::fs::remove_file(&temp_path).await {
-                error!("[{}] 清理临时文件失败: {}", self.username, e);
-            }
+            && let Err(e) = tokio::fs::remove_file(&temp_path).await
+        {
+            error!("[{}] 清理临时文件失败: {}", self.username, e);
+        }
 
         download_result
     }
@@ -305,32 +306,34 @@ impl HlsDownloader {
         // 从 M3U8 内容提取分片目标持续时间
         for line in content.lines() {
             if let Some(duration_str) = line.strip_prefix("#EXT-X-TARGETDURATION:")
-                && let Ok(duration) = duration_str.parse::<u64>() {
-                    target_duration = duration;
-                    debug!(
-                        "[{}] 检测到分片目标持续时间: {} 秒",
-                        self.username, target_duration
-                    );
-                    break;
-                }
+                && let Ok(duration) = duration_str.parse::<u64>()
+            {
+                target_duration = duration;
+                debug!(
+                    "[{}] 检测到分片目标持续时间: {} 秒",
+                    self.username, target_duration
+                );
+                break;
+            }
         }
 
         // 检查 #EXT-X-MAP 初始化分片
         if !self.init_segment_downloaded
-            && let Some(init_url) = self.extract_init_segment(&content, playlist_url)? {
-                debug!("[{}] 下载初始化分片: {}", self.username, init_url);
-                match self.download_segment(&init_url, output_file).await {
-                    Ok(()) => {
-                        debug!("[{}] 初始化分片下载成功", self.username);
-                        self.init_segment_downloaded = true;
-                        has_new_content = true; // 标记已下载初始化分片
-                    }
-                    Err(e) => {
-                        error!("[{}] 初始化分片下载失败: {}", self.username, e);
-                        return Err(e);
-                    }
+            && let Some(init_url) = self.extract_init_segment(&content, playlist_url)?
+        {
+            debug!("[{}] 下载初始化分片: {}", self.username, init_url);
+            match self.download_segment(&init_url, output_file).await {
+                Ok(()) => {
+                    debug!("[{}] 初始化分片下载成功", self.username);
+                    self.init_segment_downloaded = true;
+                    has_new_content = true; // 标记已下载初始化分片
+                }
+                Err(e) => {
+                    error!("[{}] 初始化分片下载失败: {}", self.username, e);
+                    return Err(e);
                 }
             }
+        }
 
         let playlist = m3u8_rs::parse_playlist_res(content.as_bytes())
             .map_err(|e| anyhow!("解析 M3U8 失败: {:?}", e))?;
@@ -521,22 +524,29 @@ impl HlsDownloader {
 
         debug!("[{}] 使用 FFmpeg 将 fMP4 转换为 MP4...", self.username);
 
-        let output = Command::new("ffmpeg")
-            .arg("-i")
+        let mut cmd = Command::new("ffmpeg");
+        cmd.arg("-i")
             .arg(input_path)
             .arg("-c:a")
             .arg("copy")
             .arg("-c:v")
             .arg("copy")
             .arg("-y") // 覆盖输出文件
-            .arg(output_path)
-            .output()
-            .map_err(|e| {
-                anyhow!(
-                    "运行 FFmpeg 失败: {}。请确保 FFmpeg 已安装并在 PATH 中。",
-                    e
-                )
-            })?;
+            .arg(output_path);
+
+        // Windows GUI 模式下隐藏 ffmpeg 控制台窗口
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+
+        let output = cmd.output().map_err(|e| {
+            anyhow!(
+                "运行 FFmpeg 失败: {}。请确保 FFmpeg 已安装并在 PATH 中。",
+                e
+            )
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);

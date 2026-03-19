@@ -1,21 +1,37 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
+
+/// 全局配置文件写锁，防止并发写入导致文件损坏
+static CONFIG_FILE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+/// 模特条目：用户名 + 启用状态
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelEntry {
+    pub username: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
-    pub usernames: Option<Vec<String>>, // 用户名列表
-    pub output_dir: Option<String>,     // 输出目录
-    pub resolution: Option<u32>,        // 视频分辨率
-    pub check_interval: Option<u64>,    // 检查间隔
-    pub debug: Option<bool>,            // 调试模式
-    pub proxy: Option<String>,          // 代理地址
-    pub proxy_username: Option<String>, // 代理用户名
-    pub proxy_password: Option<String>, // 代理密码
-    pub user_agent: Option<String>,     // 用户代理
-    pub log_to_file: Option<bool>,      // 是否输出日志到文件
-    pub log_file_path: Option<String>,  // 日志文件路径
-    pub cookies: Option<String>,        // Cookie 字符串
+    pub usernames: Option<Vec<ModelEntry>>, // 用户名列表（含启用状态）
+    pub output_dir: Option<String>,         // 输出目录
+    pub resolution: Option<u32>,            // 视频分辨率
+    pub check_interval: Option<u64>,        // 检查间隔
+    pub debug: Option<bool>,                // 调试模式
+    pub proxy: Option<String>,              // 代理地址
+    pub proxy_username: Option<String>,     // 代理用户名
+    pub proxy_password: Option<String>,     // 代理密码
+    pub user_agent: Option<String>,         // 用户代理
+    pub log_to_file: Option<bool>,          // 是否输出日志到文件
+    pub log_file_path: Option<String>,      // 日志文件路径
+    pub cookies: Option<String>,            // Cookie 字符串
 }
 
 impl Default for AppConfig {
@@ -51,6 +67,7 @@ impl AppConfig {
 
     /// 保存配置到文件（覆盖整个文件）
     pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        let _guard = CONFIG_FILE_LOCK.lock().unwrap();
         let content = serde_json::to_string_pretty(self).context("无法序列化配置")?;
 
         std::fs::write(path.as_ref(), content)
@@ -65,6 +82,7 @@ impl AppConfig {
         field: &str,
         value: serde_json::Value,
     ) -> Result<()> {
+        let _guard = CONFIG_FILE_LOCK.lock().unwrap();
         let path = path.as_ref();
 
         // 读取现有配置文件内容（如果存在）
@@ -103,17 +121,20 @@ impl AppConfig {
         PathBuf::from("config.json")
     }
 
-    /// 合并命令行参数到配置中（命令行参数优先）
+    /// 合并命令行参数到配置中（命令行参数优先，CLI 指定的用户名全部启用）
     pub fn merge_with_cli(&mut self, cli_args: &CliArgs) {
         if let Some(usernames_str) = &cli_args.usernames {
-            let usernames: Vec<String> = usernames_str
+            let entries: Vec<ModelEntry> = usernames_str
                 .split(',')
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .map(ToString::to_string)
+                .map(|s| ModelEntry {
+                    username: s.to_string(),
+                    enabled: true,
+                })
                 .collect();
-            if !usernames.is_empty() {
-                self.usernames = Some(usernames);
+            if !entries.is_empty() {
+                self.usernames = Some(entries);
             }
         }
 
@@ -136,12 +157,23 @@ impl AppConfig {
         self.cookies = cli_args.cookies.clone().or(self.cookies.take());
     }
 
-    /// 获取最终配置值，如果字段为None则使用默认值
+    /// 获取启用的用户名列表（仅返回 enabled=true 的）
     pub fn get_usernames(&self) -> Result<Vec<String>> {
         self.usernames
             .as_ref()
-            .cloned()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|e| e.enabled)
+                    .map(|e| e.username.clone())
+                    .collect()
+            })
             .ok_or_else(|| anyhow::anyhow!("未指定用户名"))
+    }
+
+    /// 获取所有模特条目（含启用/禁用）
+    pub fn get_model_entries(&self) -> Vec<ModelEntry> {
+        self.usernames.as_ref().cloned().unwrap_or_default()
     }
 
     pub fn get_output_dir(&self) -> String {

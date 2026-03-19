@@ -15,13 +15,15 @@ jobs:
           - target: x86_64-pc-windows-gnu
             archive: zip
             name: windows-x64
+            extra_args: "--features gui"
           - target: x86_64-unknown-linux-musl
             archive: tar.gz
             name: linux-x64
+            extra_args: ""
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Compile and release
         uses: rust-build/rust-build.action@v1.4.5
@@ -34,3 +36,4 @@ jobs:
           EXTRA_FILES: "README.md LICENSE"
           TOOLCHAIN_VERSION: stable
           MINIFY: true
+          CARGO_EXTRA_ARGS: ${{ matrix.extra_args }}

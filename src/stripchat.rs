@@ -16,6 +16,8 @@ use url::Url;
 
 use crate::config::{AppConfig, Config};
 use crate::downloader::HlsDownloader;
+#[cfg(feature = "gui")]
+use crate::shared_state::{ModelStreamStatus, SharedGuiState};
 use crate::utils::create_client;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +96,8 @@ pub struct StripChatRecorder {
     status: StreamStatus,                                    // 流状态
     shutdown_rx: Option<broadcast::Receiver<()>>,            // 关闭信号接收器
     mouflon_keys: std::collections::HashMap<String, String>, // MOUFLON密钥缓存
+    #[cfg(feature = "gui")]
+    gui_state: Option<SharedGuiState>,                       // GUI共享状态
 }
 
 impl StripChatRecorder {
@@ -153,6 +157,8 @@ impl StripChatRecorder {
             status: StreamStatus::Unknown,
             shutdown_rx: None,
             mouflon_keys,
+            #[cfg(feature = "gui")]
+            gui_state: None,
         };
 
         // 根据cookie来源处理初始化
@@ -210,6 +216,30 @@ impl StripChatRecorder {
     /// 设置关闭信号接收器
     pub fn set_shutdown_receiver(&mut self, shutdown_rx: broadcast::Receiver<()>) {
         self.shutdown_rx = Some(shutdown_rx);
+    }
+
+    /// 设置 GUI 共享状态
+    #[cfg(feature = "gui")]
+    pub fn set_gui_state(&mut self, gui_state: SharedGuiState) {
+        self.gui_state = Some(gui_state);
+    }
+
+    /// 将 StreamStatus 映射并报告到 GUI
+    #[cfg(feature = "gui")]
+    fn report_status_to_gui(&self) {
+        if let Some(ref gs) = self.gui_state {
+            let model_status = match &self.status {
+                StreamStatus::Public => ModelStreamStatus::Public,
+                StreamStatus::Private => ModelStreamStatus::Private,
+                StreamStatus::Offline => ModelStreamStatus::Offline,
+                StreamStatus::LongOffline => ModelStreamStatus::LongOffline,
+                StreamStatus::Error => ModelStreamStatus::Error,
+                StreamStatus::Unknown => ModelStreamStatus::Unknown,
+                StreamStatus::NotExist => ModelStreamStatus::NotExist,
+                StreamStatus::Restricted => ModelStreamStatus::Restricted,
+            };
+            gs.update_status(&self.config.username, model_status);
+        }
     }
 
     /// 检查是否收到关闭信号
@@ -400,6 +430,8 @@ impl StripChatRecorder {
             };
 
             self.status = status.clone();
+            #[cfg(feature = "gui")]
+            self.report_status_to_gui();
 
             match self.status {
                 StreamStatus::Public => {
@@ -795,6 +827,16 @@ impl StripChatRecorder {
 
         info!("[{}] 录制到: {:?}", self.config.username, output_path);
 
+        // 通知 GUI 开始录制
+        #[cfg(feature = "gui")]
+        if let Some(ref gs) = self.gui_state {
+            gs.set_recording(
+                &self.config.username,
+                true,
+                Some(output_path.display().to_string()),
+            );
+        }
+
         let mut downloader = HlsDownloader::new(self.client.clone(), self.config.username.clone());
 
         // 如果可用，将关闭接收器传递给下载器
@@ -807,11 +849,17 @@ impl StripChatRecorder {
         let processor = move |content: &str| {
             Self::m3u_decoder_with_dynamic_keys(content, &username, &mouflon_keys)
         };
-        downloader
+        let result = downloader
             .download_hls_stream(&video_url, &output_path, Some(&processor))
-            .await?;
+            .await;
 
-        Ok(())
+        // 通知 GUI 录制结束
+        #[cfg(feature = "gui")]
+        if let Some(ref gs) = self.gui_state {
+            gs.set_recording(&self.config.username, false, None);
+        }
+
+        result
     }
 
     /// 获取视频URL

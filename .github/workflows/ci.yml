@@ -13,13 +13,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - x86_64-pc-windows-gnu
-          - x86_64-unknown-linux-musl
+        include:
+          - target: x86_64-pc-windows-gnu
+            extra_args: "--features gui"
+          - target: x86_64-unknown-linux-musl
+            extra_args: ""
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Compile
         id: compile
@@ -30,9 +32,10 @@ jobs:
           EXTRA_FILES: "README.md LICENSE"
           ARCHIVE_TYPES: "zip"
           TOOLCHAIN_VERSION: stable
+          CARGO_EXTRA_ARGS: ${{ matrix.extra_args }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: screc-${{ matrix.target }}
           path: |

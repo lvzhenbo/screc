@@ -3,6 +3,24 @@ name = "screc"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "screc"
+path = "src/bin/screc.rs"
+
+[[bin]]
+name = "screc-gui"
+path = "src/bin/screc-gui.rs"
+required-features = ["gui"]
+
+[features]
+default = []
+gui = [
+    "dep:gpui",
+    "dep:gpui-component",
+    "dep:gpui-component-assets",
+    "dep:gpui_platform",
+]
+
 [dependencies]
 tokio = { version = "1.50.0", features = [
     "rt-multi-thread",
@@ -25,9 +43,13 @@ anyhow = "1.0.102"
 log = "0.4.29"
 fern = "0.7.1"
 colored = "3.1.1"
-clap = { version = "4.5.60", features = ["derive"] }
+clap = { version = "4.6.0", features = ["derive"] }
 rand = "0.10.0"
 regex = "1.12.3"
+gpui = { git = "https://github.com/zed-industries/zed", optional = true }
+gpui-component = { git = "https://github.com/longbridge/gpui-component", optional = true }
+gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform", optional = true }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", optional = true }
 
 # 二进制大小优化配置
 [profile.release]
