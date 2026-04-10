@@ -38,6 +38,7 @@ pub enum StreamStatus {
     Unknown,     // 未知
     NotExist,    // 不存在（模特已删除）
     Restricted,  // 受限（地理封锁）
+    Blocked,     // 已被封禁
 }
 
 #[derive(Debug, Clone)]
@@ -47,12 +48,29 @@ enum CookieSource {
     None,        // 没有cookie
 }
 
+/// 自定义反序列化：cam 字段可能是对象或空数组 []
+fn deserialize_cam_info<'de, D>(deserializer: D) -> Result<Option<CamInfo>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde_json::Value;
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::Object(_) => serde_json::from_value(value)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        Value::Null | Value::Array(_) => Ok(None),
+        _ => Ok(None),
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct ApiResponse {
     #[serde(rename = "user")]
     user: Option<UserInfoWrapper>, // 用户信息 (新API格式)
     model: Option<ModelInfo>, // 模特信息 (兼容旧格式)
-    cam: Option<CamInfo>,     // 摄像头信息
+    #[serde(deserialize_with = "deserialize_cam_info", default)]
+    cam: Option<CamInfo>, // 摄像头信息（可能是对象或空数组）
     error: Option<String>,    // 错误信息
 }
 
@@ -70,6 +88,8 @@ struct ModelInfo {
     status: String, // 状态
     #[serde(rename = "isDeleted")]
     is_deleted: Option<bool>, // 是否已删除
+    #[serde(rename = "isBlocked")]
+    is_blocked: Option<bool>, // 是否已被封禁
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -587,6 +607,15 @@ impl StripChatRecorder {
                         return Ok(());
                     }
                 }
+                StreamStatus::Blocked => {
+                    // 模特已被封禁，每5分钟检查一次是否解封
+                    if self
+                        .interruptible_sleep(tokio::time::Duration::from_secs(300))
+                        .await
+                    {
+                        return Ok(());
+                    }
+                }
             }
         }
     }
@@ -734,6 +763,16 @@ impl StripChatRecorder {
         if model_info.is_deleted.unwrap_or(false) {
             let status = StreamStatus::NotExist;
             info!("[{}] 状态: 模特已删除", self.config.username);
+            if std::mem::discriminant(&status) != std::mem::discriminant(previous_status) {
+                *previous_status = status.clone();
+            }
+            return Ok(status);
+        }
+
+        // 检查是否已被封禁
+        if model_info.is_blocked.unwrap_or(false) {
+            let status = StreamStatus::Blocked;
+            info!("[{}] 状态: 模特已被封禁", self.config.username);
             if std::mem::discriminant(&status) != std::mem::discriminant(previous_status) {
                 *previous_status = status.clone();
             }

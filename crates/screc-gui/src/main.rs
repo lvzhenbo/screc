@@ -30,6 +30,7 @@ impl RecorderCallback for GuiRecorderCallback {
             StreamStatus::Unknown => ModelStreamStatus::Unknown,
             StreamStatus::NotExist => ModelStreamStatus::NotExist,
             StreamStatus::Restricted => ModelStreamStatus::Restricted,
+            StreamStatus::Blocked => ModelStreamStatus::Blocked,
         };
         self.0.update_status(username, gui_status);
     }
@@ -144,7 +145,6 @@ async fn run_gui_mode(app_config: AppConfig, config_path: PathBuf) -> Result<()>
         original_config_cookies,
         proxy_config,
         gui_state.clone(),
-        enabled_usernames,
     ));
 
     // 运行 GUI（阻塞主线程）
@@ -172,26 +172,11 @@ async fn run_model_manager(
     original_config_cookies: Option<String>,
     proxy_config: Option<ProxyConfig>,
     gui_state: SharedGuiState,
-    initial_usernames: Vec<String>,
 ) {
     let mut active: HashMap<String, (broadcast::Sender<()>, tokio::task::JoinHandle<()>)> =
         HashMap::new();
 
-    // 启动初始已启用的模特录制任务
-    for username in initial_usernames {
-        let (tx, rx) = broadcast::channel(1);
-        let handle = spawn_gui_recorder_task(
-            username.clone(),
-            &shared_app_config,
-            &shared_config_path,
-            &original_config_cookies,
-            &proxy_config,
-            rx,
-            gui_state.clone(),
-        )
-        .await;
-        active.insert(username, (tx, handle));
-    }
+    // 默认不启动录制，等待用户通过 GUI 开启总开关
 
     // 事件循环：监听启停命令和全局关闭信号
     loop {
@@ -199,7 +184,7 @@ async fn run_model_manager(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(ModelCommand::Enable(username)) => {
-                        if active.contains_key(&username) {
+                        if active.contains_key(&username) || !gui_state.is_recording_active() {
                             continue;
                         }
                         info!("启用用户 {} 的录制", username);
@@ -223,7 +208,7 @@ async fn run_model_manager(
                         }
                     }
                     Some(ModelCommand::Add(username, enabled)) => {
-                        if enabled && !active.contains_key(&username) {
+                        if enabled && gui_state.is_recording_active() && !active.contains_key(&username) {
                             info!("新增并启用用户 {} 的录制", username);
                             let (tx, rx) = broadcast::channel(1);
                             let handle = spawn_gui_recorder_task(
@@ -242,6 +227,38 @@ async fn run_model_manager(
                     Some(ModelCommand::Remove(username)) => {
                         if let Some((tx, _)) = active.remove(&username) {
                             info!("删除用户 {}，停止录制", username);
+                            let _ = tx.send(());
+                        }
+                    }
+                    Some(ModelCommand::StartAll) => {
+                        let models = gui_state.get_models();
+                        let to_start: Vec<String> = models
+                            .iter()
+                            .filter(|m| m.enabled && !active.contains_key(&m.username))
+                            .map(|m| m.username.clone())
+                            .collect();
+                        if !to_start.is_empty() {
+                            info!("启动录制，共 {} 个用户", to_start.len());
+                            for username in to_start {
+                                let (tx, rx) = broadcast::channel(1);
+                                let handle = spawn_gui_recorder_task(
+                                    username.clone(),
+                                    &shared_app_config,
+                                    &shared_config_path,
+                                    &original_config_cookies,
+                                    &proxy_config,
+                                    rx,
+                                    gui_state.clone(),
+                                )
+                                .await;
+                                active.insert(username, (tx, handle));
+                            }
+                        }
+                    }
+                    Some(ModelCommand::StopAll) => {
+                        info!("停止所有录制任务，共 {} 个", active.len());
+                        for (username, (tx, _)) in active.drain() {
+                            info!("停止用户 {} 的录制", username);
                             let _ = tx.send(());
                         }
                     }

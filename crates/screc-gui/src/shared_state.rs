@@ -11,6 +11,10 @@ pub enum ModelCommand {
     Disable(String),
     Add(String, bool),
     Remove(String),
+    /// 启动所有已启用模特的录制
+    StartAll,
+    /// 停止所有录制
+    StopAll,
 }
 
 /// 模特状态信息（用于 GUI 展示）
@@ -36,6 +40,7 @@ pub enum ModelStreamStatus {
     Unknown,
     NotExist,
     Restricted,
+    Blocked,
 }
 
 impl ModelStreamStatus {
@@ -49,6 +54,7 @@ impl ModelStreamStatus {
             Self::Unknown => "未知",
             Self::NotExist => "不存在",
             Self::Restricted => "受限",
+            Self::Blocked => "已封禁",
         }
     }
 }
@@ -92,6 +98,7 @@ struct SharedGuiStateInner {
     max_logs: usize,
     config_path: Option<PathBuf>,
     command_tx: Option<tokio::sync::mpsc::UnboundedSender<ModelCommand>>,
+    recording_active: bool,
 }
 
 impl SharedGuiState {
@@ -103,6 +110,7 @@ impl SharedGuiState {
                 max_logs: 100_000,
                 config_path: None,
                 command_tx: None,
+                recording_active: false,
             })),
         }
     }
@@ -224,6 +232,25 @@ impl SharedGuiState {
             }
         }
         Self::sync_config_inner(&inner);
+    }
+
+    /// 获取总录制开关状态
+    pub fn is_recording_active(&self) -> bool {
+        self.inner.lock().unwrap().recording_active
+    }
+
+    /// 设置总录制开关
+    pub fn set_recording_active(&self, active: bool) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.recording_active = active;
+        if let Some(ref tx) = inner.command_tx {
+            let cmd = if active {
+                ModelCommand::StartAll
+            } else {
+                ModelCommand::StopAll
+            };
+            let _ = tx.send(cmd);
+        }
     }
 
     /// 删除模特

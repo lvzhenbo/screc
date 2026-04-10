@@ -24,6 +24,7 @@ pub struct AppView {
     log_font: SharedString,
     new_model_input: Entity<InputState>,
     new_model_enabled: bool,
+    focus_handle: FocusHandle,
     _refresh_task: Task<()>,
     _appearance_subscription: Subscription,
 }
@@ -41,6 +42,7 @@ impl AppView {
             .into();
 
         let new_model_input = cx.new(|cx| InputState::new(window, cx).placeholder("输入用户名..."));
+        let focus_handle = cx.focus_handle();
 
         // 同步系统主题并监听变化
         Theme::sync_system_appearance(Some(window), &mut *cx);
@@ -75,6 +77,7 @@ impl AppView {
             log_font,
             new_model_input,
             new_model_enabled: true,
+            focus_handle,
             _refresh_task: refresh_task,
             _appearance_subscription: appearance_subscription,
         }
@@ -92,6 +95,7 @@ impl AppView {
             ModelStreamStatus::Unknown => Tag::secondary().child(label),
             ModelStreamStatus::NotExist => Tag::danger().child(label),
             ModelStreamStatus::Restricted => Tag::warning().child(label),
+            ModelStreamStatus::Blocked => Tag::danger().child(label),
         }
     }
 
@@ -223,7 +227,11 @@ impl AppView {
                     .h_flex()
                     .gap_2()
                     .items_center()
-                    .child(div().w(px(200.)).child(Input::new(&self.new_model_input)))
+                    .child(
+                        div()
+                            .w(px(300.))
+                            .child(Input::new(&self.new_model_input).cleanable(true)),
+                    )
                     .child(
                         div()
                             .h_flex()
@@ -452,6 +460,8 @@ impl Render for AppView {
         let total_count = models.len();
 
         div()
+            .id("app-root")
+            .track_focus(&self.focus_handle)
             .v_flex()
             .size_full()
             .bg(cx.theme().background)
@@ -469,12 +479,44 @@ impl Render for AppView {
                     .items_center()
                     .justify_between()
                     .child(
-                        div().h_flex().gap_3().items_center().child(
-                            div()
-                                .text_base()
-                                .font_weight(FontWeight::BOLD)
-                                .child("Screc 录制监控"),
-                        ),
+                        div()
+                            .h_flex()
+                            .gap_3()
+                            .items_center()
+                            .child(
+                                div()
+                                    .text_base()
+                                    .font_weight(FontWeight::BOLD)
+                                    .child("Screc 录制监控"),
+                            )
+                            .child({
+                                let is_active = self.gui_state.is_recording_active();
+                                let gui_state = self.gui_state.clone();
+                                let (label, color) = if is_active {
+                                    ("录制中", cx.theme().success)
+                                } else {
+                                    ("已停止", cx.theme().muted_foreground)
+                                };
+                                div()
+                                    .h_flex()
+                                    .gap_1p5()
+                                    .items_center()
+                                    .pl_2()
+                                    .border_l_1()
+                                    .border_color(cx.theme().border)
+                                    .child(div().text_sm().text_color(color).child(label))
+                                    .child(
+                                        Switch::new("master-recording")
+                                            .checked(is_active)
+                                            .xsmall()
+                                            .on_click(cx.listener(
+                                                move |_this, checked: &bool, _window, cx| {
+                                                    gui_state.set_recording_active(*checked);
+                                                    cx.notify();
+                                                },
+                                            )),
+                                    )
+                            }),
                     )
                     .child(
                         div()
@@ -560,6 +602,7 @@ pub fn run_gui(gui_state: SharedGuiState) {
     let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
 
     app.run(move |cx: &mut App| {
+        gpui_component::set_locale("zh-CN");
         gpui_component::init(cx);
 
         let gui_state_clone = gui_state.clone();
