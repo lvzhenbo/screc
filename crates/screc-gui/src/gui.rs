@@ -1,16 +1,21 @@
 use std::rc::Rc;
+use std::time::Duration;
 
 use chrono::Local;
+use gpui::AppContext as _;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::input::{Input, InputState};
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::scroll::ScrollableElement as _;
+use gpui_component::setting::{NumberFieldOptions, SettingField, SettingGroup, SettingItem, SettingPage, Settings};
 use gpui_component::switch::Switch;
 use gpui_component::tab::{Tab, TabBar};
 use gpui_component::table::{TableBody, TableCell, TableHead, TableHeader, TableRow};
 use gpui_component::tag::Tag;
 use gpui_component::tooltip::Tooltip;
 use gpui_component::*;
+
+use screc_core::config::AppConfig;
 
 use crate::shared_state::{LogLevel, ModelStreamStatus, SharedGuiState};
 
@@ -27,6 +32,10 @@ pub struct AppView {
     focus_handle: FocusHandle,
     _refresh_task: Task<()>,
     _appearance_subscription: Subscription,
+
+    // 配置切换
+    settings_new_config_path: Entity<InputState>,
+    settings_config_switch_error: Option<String>,
 }
 
 impl AppView {
@@ -51,7 +60,7 @@ impl AppView {
             cx.notify();
         });
 
-        // 每秒刷新一次，只 spawn 一次
+        // 每秒刷新一次
         let refresh_task = cx.spawn(async |entity: WeakEntity<Self>, cx: &mut AsyncApp| {
             loop {
                 cx.background_executor()
@@ -68,6 +77,8 @@ impl AppView {
             }
         });
 
+        let settings_new_config_path = cx.new(|cx| InputState::new(window, cx));
+
         Self {
             gui_state,
             selected_tab: 0,
@@ -80,7 +91,23 @@ impl AppView {
             focus_handle,
             _refresh_task: refresh_task,
             _appearance_subscription: appearance_subscription,
+
+            settings_new_config_path,
+            settings_config_switch_error: None,
         }
+    }
+
+    /// 防抖保存辅助：从 &mut App 上下文中异步写入配置文件
+    fn debounced_update_field(key: &'static str, value: serde_json::Value, _cx: &mut App, gui_state: &SharedGuiState) {
+        let state = gui_state.clone();
+        let key = key.to_string();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let config_path = state.get_config_path();
+            if let Some(ref path) = config_path {
+                let _ = AppConfig::update_field(path, &key, value);
+            }
+        });
     }
 
     /// 状态对应的标签颜色
@@ -447,6 +474,363 @@ impl AppView {
                     .vertical_scrollbar(&self.log_scroll_handle),
             )
     }
+
+    // ─── 设置页（使用 gpui-component settings 组件）───────────────
+
+    fn build_recording_page(&self) -> SettingPage {
+        let state = self.gui_state.clone();
+
+        SettingPage::new("录制")
+            .default_open(true)
+            .groups(vec![SettingGroup::new().title("录制设置").items(vec![
+                {
+                    let s = state.clone();
+                    SettingItem::new("输出目录",
+                        SettingField::input(
+                            {
+                                let sc = s.clone();
+                                move |_: &App| sc.with_app_config(|c| SharedString::from(c.get_output_dir()))
+                            },
+                            move |val: SharedString, cx: &mut App| {
+                                let v = val.to_string();
+                                s.with_app_config_mut(|c| c.output_dir = Some(v.clone()));
+                                Self::debounced_update_field("output_dir", serde_json::Value::String(v), cx, &s);
+                            },
+                        ),
+                    )
+                    .description("录制视频的保存目录")
+                },
+                {
+                    let s = state.clone();
+                    SettingItem::new("分辨率",
+                        SettingField::number_input(
+                            NumberFieldOptions { min: 240.0, max: 2160.0, step: 120.0 },
+                            {
+                                let sc = s.clone();
+                                move |_: &App| sc.with_app_config(|c| c.get_resolution() as f64)
+                            },
+                            move |val: f64, cx: &mut App| {
+                                let v = val as u32;
+                                s.with_app_config_mut(|c| c.resolution = Some(v));
+                                Self::debounced_update_field("resolution", serde_json::Value::from(v), cx, &s);
+                            },
+                        ),
+                    )
+                    .description("视频分辨率 (240-2160，步长 120)")
+                },
+                {
+                    let s = state.clone();
+                    SettingItem::new("检查间隔 (秒)",
+                        SettingField::number_input(
+                            NumberFieldOptions { min: 10.0, max: 300.0, step: 5.0 },
+                            {
+                                let sc = s.clone();
+                                move |_: &App| sc.with_app_config(|c| c.get_check_interval() as f64)
+                            },
+                            move |val: f64, cx: &mut App| {
+                                let v = val as u64;
+                                s.with_app_config_mut(|c| c.check_interval = Some(v));
+                                Self::debounced_update_field("check_interval", serde_json::Value::from(v), cx, &s);
+                            },
+                        ),
+                    )
+                    .description("检查模特在线状态的时间间隔")
+                },
+            ])])
+    }
+
+    fn build_network_page(&self) -> SettingPage {
+        let state = self.gui_state.clone();
+
+        SettingPage::new("网络")
+            .groups(vec![SettingGroup::new().title("网络与代理").items(vec![
+                {
+                    let s = state.clone();
+                    SettingItem::new("代理地址",
+                        SettingField::input(
+                            {
+                                let sc = s.clone();
+                                move |_: &App| sc.with_app_config(|c| SharedString::from(c.get_proxy().unwrap_or_default()))
+                            },
+                            move |val: SharedString, cx: &mut App| {
+                                let v = val.to_string();
+                                s.with_app_config_mut(|c| c.proxy = if v.is_empty() { None } else { Some(v.clone()) });
+                                Self::debounced_update_field("proxy", serde_json::Value::String(v), cx, &s);
+                            },
+                        ),
+                    )
+                },
+                {
+                    let s = state.clone();
+                    SettingItem::new("代理用户名",
+                        SettingField::input(
+                            {
+                                let sc = s.clone();
+                                move |_: &App| sc.with_app_config(|c| SharedString::from(c.get_proxy_username().unwrap_or_default()))
+                            },
+                            move |val: SharedString, cx: &mut App| {
+                                let v = val.to_string();
+                                s.with_app_config_mut(|c| c.proxy_username = if v.is_empty() { None } else { Some(v.clone()) });
+                                Self::debounced_update_field("proxy_username", serde_json::Value::String(v), cx, &s);
+                            },
+                        ),
+                    )
+                },
+                {
+                    let s = state.clone();
+                    SettingItem::new("代理密码",
+                        SettingField::input(
+                            {
+                                let sc = s.clone();
+                                move |_: &App| sc.with_app_config(|c| SharedString::from(c.get_proxy_password().unwrap_or_default()))
+                            },
+                            move |val: SharedString, cx: &mut App| {
+                                let v = val.to_string();
+                                s.with_app_config_mut(|c| c.proxy_password = if v.is_empty() { None } else { Some(v.clone()) });
+                                Self::debounced_update_field("proxy_password", serde_json::Value::String(v), cx, &s);
+                            },
+                        ),
+                    )
+                },
+                {
+                    let s = state.clone();
+                    SettingItem::new("User-Agent",
+                        SettingField::render({
+                            let gui = s.clone();
+                            move |options, window, cx| {
+                                let ua = gui.with_app_config(|c|
+                                    SharedString::from(c.get_user_agent())
+                                );
+                                let state_key = format!("ua-field-p{}g{}i{}",
+                                    options.page_ix, options.group_ix, options.item_ix);
+
+                                let state = window.use_keyed_state(
+                                    SharedString::from(state_key),
+                                    cx,
+                                    |window, cx| {
+                                        let input = cx.new(|cx| {
+                                            InputState::new(window, cx)
+                                                .multi_line(true)
+                                                .rows(3)
+                                                .default_value(ua)
+                                        });
+                                        let g = gui.clone();
+                                        let _sub = cx.subscribe(&input, move |_, input, event: &InputEvent, cx| {
+                                            if let InputEvent::Change = event {
+                                                let val = input.read(cx).value().to_string();
+                                                g.with_app_config_mut(|c| c.user_agent = Some(val.clone()));
+                                                let g2 = g.clone();
+                                                tokio::spawn(async move {
+                                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                                    if let Some(ref path) = g2.get_config_path() {
+                                                        let _ = AppConfig::update_field(path, "user_agent", serde_json::Value::String(val));
+                                                    }
+                                                });
+                                            }
+                                        });
+                                        (input, _sub)
+                                    },
+                                )
+                                .read(cx);
+
+                                let (input, _) = state;
+                                Input::new(input)
+                                    .w_full()
+                                    .h(px(72.))
+                                    .into_any_element()
+                            }
+                        }),
+                    )
+                    .layout(Axis::Vertical)
+                },
+                {
+                    let s = state.clone();
+                    SettingItem::new("Cookies",
+                        SettingField::render({
+                            let gui = s.clone();
+                            move |options, window, cx| {
+                                let recording_active = gui.is_recording_active();
+                                let cookies = gui.with_app_config(|c|
+                                    SharedString::from(c.get_cookies().unwrap_or_default())
+                                );
+                                let state_key = format!("cookies-field-p{}g{}i{}",
+                                    options.page_ix, options.group_ix, options.item_ix);
+
+                                let state = window.use_keyed_state(
+                                    SharedString::from(state_key),
+                                    cx,
+                                    |window, cx| {
+                                        let input = cx.new(|cx| {
+                                            InputState::new(window, cx)
+                                                .multi_line(true)
+                                                .rows(4)
+                                                .placeholder("输入 Cookie 字符串...")
+                                                .default_value(cookies)
+                                        });
+                                        let g = gui.clone();
+                                        let _sub = cx.subscribe(&input, move |_, input, event: &InputEvent, cx| {
+                                            if let InputEvent::Change = event {
+                                                if !g.is_recording_active() {
+                                                    let val = input.read(cx).value().to_string();
+                                                    g.with_app_config_mut(|c| c.cookies = if val.is_empty() { None } else { Some(val.clone()) });
+                                                    let g2 = g.clone();
+                                                    tokio::spawn(async move {
+                                                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                                        if let Some(ref path) = g2.get_config_path() {
+                                                            let _ = AppConfig::update_field(path, "cookies", serde_json::Value::String(val));
+                                                        }
+                                                    });
+                                                }
+                                            }
+                                        });
+                                        (input, _sub)
+                                    },
+                                )
+                                .read(cx);
+
+                                let (input, _) = state;
+                                Input::new(input)
+                                    .disabled(recording_active)
+                                    .w_full()
+                                    .h(px(100.))
+                                    .into_any_element()
+                            }
+                        }),
+                    )
+                    .description("录制运行中不可编辑")
+                    .layout(Axis::Vertical)
+                },
+            ])])
+    }
+
+    fn build_logging_page(&self) -> SettingPage {
+        let state = self.gui_state.clone();
+
+        SettingPage::new("日志")
+            .groups(vec![SettingGroup::new().title("日志设置").items(vec![
+                {
+                    let s = state.clone();
+                    SettingItem::new("调试日志",
+                        SettingField::switch(
+                            {
+                                let sc = s.clone();
+                                move |_: &App| sc.with_app_config(|c| c.get_debug())
+                            },
+                            move |val: bool, cx: &mut App| {
+                                s.with_app_config_mut(|c| c.debug = Some(val));
+                                Self::debounced_update_field("debug", serde_json::Value::Bool(val), cx, &s);
+                            },
+                        ),
+                    )
+                    .description("启用详细的调试日志输出")
+                },
+                {
+                    let s = state.clone();
+                    SettingItem::new("输出日志到文件",
+                        SettingField::switch(
+                            {
+                                let sc = s.clone();
+                                move |_: &App| sc.with_app_config(|c| c.get_log_to_file())
+                            },
+                            move |val: bool, cx: &mut App| {
+                                s.with_app_config_mut(|c| c.log_to_file = Some(val));
+                                Self::debounced_update_field("log_to_file", serde_json::Value::Bool(val), cx, &s);
+                            },
+                        ),
+                    )
+                    .description("将日志同时写入文件")
+                },
+                {
+                    let s = state.clone();
+                    SettingItem::new("日志文件路径",
+                        SettingField::input(
+                            {
+                                let sc = s.clone();
+                                move |_: &App| sc.with_app_config(|c| SharedString::from(c.get_log_file_path()))
+                            },
+                            move |val: SharedString, cx: &mut App| {
+                                let v = val.to_string();
+                                s.with_app_config_mut(|c| c.log_file_path = Some(v.clone()));
+                                Self::debounced_update_field("log_file_path", serde_json::Value::String(v), cx, &s);
+                            },
+                        ),
+                    )
+                    .description("日志文件的保存路径")
+                },
+            ])])
+    }
+
+    fn render_settings_page(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let recording_page = self.build_recording_page();
+        let network_page = self.build_network_page();
+        let logging_page = self.build_logging_page();
+
+        let current_path = self.gui_state.get_config_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "未设置".to_string());
+        let error_message = self.settings_config_switch_error.clone();
+        let recording_active = self.gui_state.is_recording_active();
+
+        div()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .v_flex()
+            .gap_4()
+            .child(Settings::new(format!("app-settings-v{}", self.gui_state.config_version())).pages(vec![recording_page, network_page, logging_page]))
+            .child(
+                div().v_flex().gap_2().child(
+                    div().text_sm().font_weight(FontWeight::BOLD).child("配置文件"),
+                )
+                .child(
+                    div().v_flex().gap_1().child(
+                        div().text_xs().text_color(cx.theme().muted_foreground)
+                            .child(format!("当前: {}{}", current_path,
+                                if recording_active { "（停止录制后可切换）" } else { "" })),
+                    )
+                )
+                .child(
+                    h_flex().gap_2().items_center()
+                        .child(div().flex_1().child(Input::new(&self.settings_new_config_path).disabled(recording_active)))
+                        .child({
+                            let gui_state = self.gui_state.clone();
+                            let new_path_input = self.settings_new_config_path.clone();
+                            let mut btn = Button::new("switch-config")
+                                .compact()
+                                .primary()
+                                .label("校验并切换");
+                            if !recording_active {
+                                btn = btn.on_click(cx.listener(move |this, _ev, _window, cx| {
+                                    let path_str = new_path_input.read(cx).value().to_string();
+                                    let path = std::path::PathBuf::from(path_str.trim());
+                                    if path_str.trim().is_empty() {
+                                        this.settings_config_switch_error = Some("请输入配置文件路径".into());
+                                        cx.notify();
+                                        return;
+                                    }
+                                    match gui_state.switch_config(&path) {
+                                        Ok(()) => {
+                                            this.settings_config_switch_error = None;
+                                        }
+                                        Err(e) => {
+                                            this.settings_config_switch_error = Some(format!("切换失败: {}", e));
+                                        }
+                                    }
+                                    cx.notify();
+                                }));
+                            }
+                            btn
+                        })
+                )
+                .child(
+                    if let Some(ref err) = error_message {
+                        div().text_xs().text_color(cx.theme().danger).child(err.clone())
+                    } else {
+                        div()
+                    }
+                )
+            )
+    }
 }
 
 impl Render for AppView {
@@ -559,15 +943,18 @@ impl Render for AppView {
                             cx.notify();
                         }))
                         .child(Tab::new().label("模特状态"))
-                        .child(Tab::new().label("日志")),
+                        .child(Tab::new().label("日志"))
+                        .child(Tab::new().label("设置")),
                 ),
             )
             // 内容区域
             .child(div().v_flex().flex_1().min_h_0().w_full().p_4().child(
                 if self.selected_tab == 0 {
                     self.render_model_list(window, cx).into_any_element()
-                } else {
+                } else if self.selected_tab == 1 {
                     self.render_log_panel(window, cx).into_any_element()
+                } else {
+                    self.render_settings_page(cx).into_any_element()
                 },
             ))
             // 底部状态栏

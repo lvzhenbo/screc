@@ -99,6 +99,8 @@ struct SharedGuiStateInner {
     config_path: Option<PathBuf>,
     command_tx: Option<tokio::sync::mpsc::UnboundedSender<ModelCommand>>,
     recording_active: bool,
+    app_config: Option<Arc<tokio::sync::Mutex<AppConfig>>>,
+    config_version: u64,
 }
 
 impl SharedGuiState {
@@ -111,6 +113,8 @@ impl SharedGuiState {
                 config_path: None,
                 command_tx: None,
                 recording_active: false,
+                app_config: None,
+                config_version: 0,
             })),
         }
     }
@@ -120,9 +124,95 @@ impl SharedGuiState {
         self.inner.lock().unwrap().config_path = Some(path);
     }
 
+    pub fn get_config_path(&self) -> Option<PathBuf> {
+        self.inner.lock().unwrap().config_path.clone()
+    }
+
+    pub fn config_version(&self) -> u64 {
+        self.inner.lock().unwrap().config_version
+    }
+
+    /// 切换配置文件：停止录制 → 重载配置 → 重建模型列表
+    pub fn switch_config(&self, new_path: &std::path::Path) -> anyhow::Result<()> {
+        // 0. 从新路径加载配置（在锁外完成，避免 I/O 阻塞 GUI）
+        let new_config = AppConfig::from_file(new_path)?;
+
+        let mut inner = self.inner.lock().unwrap();
+
+        // 1. 停止所有录制
+        inner.recording_active = false;
+        if let Some(ref tx) = inner.command_tx {
+            let _ = tx.send(ModelCommand::StopAll);
+        }
+
+        // 2. 更新 shared_app_config
+        let app_config = inner
+            .app_config
+            .as_ref()
+            .expect("app_config not set; call set_app_config() during initialization");
+        *tokio::task::block_in_place(|| app_config.blocking_lock()) = new_config.clone();
+
+        // 3. 更新 config_path
+        inner.config_path = Some(new_path.to_path_buf());
+        inner.config_version += 1;
+
+        // 4. 重建模型列表
+        let entries = new_config.get_model_entries();
+        inner.models = entries
+            .iter()
+            .map(|e| ModelStatus {
+                username: e.username.clone(),
+                enabled: e.enabled,
+                status: ModelStreamStatus::Unknown,
+                is_recording: false,
+                recording_start: None,
+                last_check: None,
+                file_path: None,
+            })
+            .collect();
+
+        Ok(())
+    }
+
     /// 设置命令发送器（用于通知管理器启停模特）
     pub fn set_command_sender(&self, tx: tokio::sync::mpsc::UnboundedSender<ModelCommand>) {
         self.inner.lock().unwrap().command_tx = Some(tx);
+    }
+
+    pub fn set_app_config(&self, config: Arc<tokio::sync::Mutex<AppConfig>>) {
+        self.inner.lock().unwrap().app_config = Some(config);
+    }
+
+    pub fn with_app_config<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&AppConfig) -> R,
+    {
+        let app_config = {
+            let inner = self.inner.lock().unwrap();
+            inner
+                .app_config
+                .as_ref()
+                .expect("app_config not set; call set_app_config() during initialization")
+                .clone()
+        };
+        let config = tokio::task::block_in_place(|| app_config.blocking_lock());
+        f(&config)
+    }
+
+    pub fn with_app_config_mut<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut AppConfig) -> R,
+    {
+        let app_config = {
+            let inner = self.inner.lock().unwrap();
+            inner
+                .app_config
+                .as_ref()
+                .expect("app_config not set; call set_app_config() during initialization")
+                .clone()
+        };
+        let mut config = tokio::task::block_in_place(|| app_config.blocking_lock());
+        f(&mut config)
     }
 
     /// 设置 / 初始化模特列表

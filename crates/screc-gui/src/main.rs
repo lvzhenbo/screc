@@ -130,6 +130,7 @@ async fn run_gui_mode(app_config: AppConfig, config_path: PathBuf) -> Result<()>
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
     let shared_app_config = Arc::new(Mutex::new(app_config));
+    gui_state.set_app_config(shared_app_config.clone());
     let shared_config_path = if config_path.exists() {
         Some(config_path)
     } else {
