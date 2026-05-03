@@ -520,6 +520,7 @@ impl StripChatRecorder {
                                 );
                                 if let Err(e) = self.record_stream().await {
                                     error!("[{}] 私人秀录制失败: {}", self.config.username, e);
+                                    self.status = StreamStatus::Error;
                                 }
                                 // 录制完成后等待一段时间再检查
                                 if self
