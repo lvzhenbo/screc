@@ -169,6 +169,10 @@ impl StripChatRecorder {
                 "Ook7quaiNgiyuhai".to_string(),
                 "EQueeGh2kaewa3ch".to_string(),
             ),
+            (
+                "Fq6m2TO2ZeBkRPm9".to_string(),
+                "xb6di1NF9EFXHUwb".to_string(),
+            ),
         ]);
 
         let instance = Self {
@@ -1072,12 +1076,11 @@ impl StripChatRecorder {
         }
     }
 
-    /// 解析主播放列表（参考 cbstream：从 MOUFLON 行提取 psch/pkey 并附加到变体 URL）
-    fn parse_master_playlist(&self, content: &str, base_url: &str) -> Result<Vec<PlaylistVariant>> {
-        // 从主播放列表中提取 MOUFLON psch/pkey（参考 cbstream：使用最后一个 MOUFLON 行）
-        let mut mouflon_psch: Option<String> = None;
-        let mut mouflon_pkey: Option<String> = None;
-
+    /// 从主播放列表内容中反向搜索最后一条 MOUFLON 行（备用策略）
+    fn find_last_mouflon_in_content(
+        content: &str,
+        username: &str,
+    ) -> (Option<String>, Option<String>) {
         if content.contains("EXT-X-MOUFLON") {
             for line in content.lines().rev() {
                 if !line.contains("EXT-X-MOUFLON") {
@@ -1085,16 +1088,41 @@ impl StripChatRecorder {
                 }
                 let segments: Vec<&str> = line.split(':').collect();
                 if segments.len() >= 4 {
-                    mouflon_psch = Some(segments[2].to_string());
-                    mouflon_pkey = Some(segments[3].to_string());
                     debug!(
-                        "[{}] 从主播放列表提取 MOUFLON: psch={}, pkey={}",
-                        self.config.username, segments[2], segments[3]
+                        "[{}] 从主播放列表提取 MOUFLON (反向搜索): psch={}, pkey={}",
+                        username, segments[2], segments[3]
                     );
-                    break;
+                    return (Some(segments[2].to_string()), Some(segments[3].to_string()));
                 }
             }
         }
+        (None, None)
+    }
+
+    /// 解析主播放列表（参考 cbstream：从 MOUFLON 行提取 psch/pkey 并附加到变体 URL）
+    fn parse_master_playlist(&self, content: &str, base_url: &str) -> Result<Vec<PlaylistVariant>> {
+        // 优先使用 extract_mouflon_params 已找到的参数（尤其是已知密钥映射的）
+        // 如果 self.psch/self.pkey 中有已知映射的 pkey，直接使用
+        let (mouflon_psch, mouflon_pkey) =
+            if let (Some(psch), Some(pkey)) = (&self.psch, &self.pkey) {
+                if self.mouflon_keys.contains_key(pkey) {
+                    debug!(
+                        "[{}] 使用已提取的 MOUFLON 参数 (有密钥映射): psch={}, pkey={}",
+                        self.config.username, psch, pkey
+                    );
+                    (Some(psch.clone()), Some(pkey.clone()))
+                } else {
+                    // 已存储的 pkey 无映射，回退到反向搜索最后一个 MOUFLON 行
+                    debug!(
+                        "[{}] 已提取的 pkey={} 无密钥映射，回退到主播放列表反向搜索",
+                        self.config.username, pkey
+                    );
+                    Self::find_last_mouflon_in_content(content, &self.config.username)
+                }
+            } else {
+                // extract_mouflon_params 未找到，反向搜索
+                Self::find_last_mouflon_in_content(content, &self.config.username)
+            };
 
         let playlist = m3u8_rs::parse_playlist_res(content.as_bytes())
             .map_err(|e| anyhow!("解析主播放列表失败: {:?}", e))?;
