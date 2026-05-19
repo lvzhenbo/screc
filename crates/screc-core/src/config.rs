@@ -32,6 +32,7 @@ pub struct AppConfig {
     pub log_to_file: Option<bool>,          // 是否输出日志到文件
     pub log_file_path: Option<String>,      // 日志文件路径
     pub cookies: Option<String>,            // Cookie 字符串
+    pub mouflon_keys: Option<std::collections::HashMap<String, String>>, // MOUFLON 自定义密钥映射
 }
 
 impl Default for AppConfig {
@@ -49,6 +50,7 @@ impl Default for AppConfig {
             log_to_file: Some(true),
             log_file_path: Some("logs".to_string()),
             cookies: None,
+            mouflon_keys: None,
         }
     }
 }

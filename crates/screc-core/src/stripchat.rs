@@ -156,7 +156,7 @@ impl StripChatRecorder {
 
         // 初始化已知的 MOUFLON 密钥映射（参考 cbstream 项目）
         // pkey（密钥ID）-> actual_key（实际解密密钥）
-        let mouflon_keys = std::collections::HashMap::from([
+        let mut mouflon_keys = std::collections::HashMap::from([
             (
                 "Zeechoej4aleeshi".to_string(),
                 "ubahjae7goPoodi6".to_string(),
@@ -170,6 +170,21 @@ impl StripChatRecorder {
                 "EQueeGh2kaewa3ch".to_string(),
             ),
         ]);
+
+        // 合并配置文件中的自定义密钥映射（用户自定义密钥优先）
+        {
+            let app_cfg = app_config.lock().await;
+            if let Some(ref custom_keys) = app_cfg.mouflon_keys {
+                debug!(
+                    "[{}] 从配置文件加载了 {} 个自定义 MOUFLON 密钥",
+                    config.username,
+                    custom_keys.len()
+                );
+                for (pkey, actual_key) in custom_keys {
+                    mouflon_keys.insert(pkey.clone(), actual_key.clone());
+                }
+            }
+        }
 
         let instance = Self {
             config,
@@ -1071,26 +1086,41 @@ impl StripChatRecorder {
         }
     }
 
-    /// 解析主播放列表（参考 cbstream：从 MOUFLON 行提取 psch/pkey 并附加到变体 URL）
+    /// 解析主播放列表（参考 cbstream：遍历所有 MOUFLON 行，优先使用已知密钥的 pkey）
     fn parse_master_playlist(&self, content: &str, base_url: &str) -> Result<Vec<PlaylistVariant>> {
-        // 从主播放列表中提取 MOUFLON psch/pkey（参考 cbstream：使用最后一个 MOUFLON 行）
+        // 从主播放列表中提取 MOUFLON psch/pkey
+        // 与 StreaMonitor 一致：遍历所有 MOUFLON PSCH 行，优先使用有已知密钥映射的 pkey
         let mut mouflon_psch: Option<String> = None;
         let mut mouflon_pkey: Option<String> = None;
 
         if content.contains("EXT-X-MOUFLON") {
-            for line in content.lines().rev() {
-                if !line.contains("EXT-X-MOUFLON") {
+            for line in content.lines() {
+                if !line.starts_with("#EXT-X-MOUFLON:PSCH:") {
                     continue;
                 }
                 let segments: Vec<&str> = line.split(':').collect();
                 if segments.len() >= 4 {
-                    mouflon_psch = Some(segments[2].to_string());
-                    mouflon_pkey = Some(segments[3].to_string());
-                    debug!(
-                        "[{}] 从主播放列表提取 MOUFLON: psch={}, pkey={}",
-                        self.config.username, segments[2], segments[3]
-                    );
-                    break;
+                    let psch = segments[2].to_string();
+                    let pkey = segments[3].to_string();
+                    // 优先使用有已知密钥映射的 pkey
+                    if self.mouflon_keys.contains_key(&pkey) {
+                        mouflon_psch = Some(psch);
+                        mouflon_pkey = Some(pkey);
+                        debug!(
+                            "[{}] 从主播放列表提取 MOUFLON (有密钥映射): psch={}, pkey={}",
+                            self.config.username, segments[2], segments[3]
+                        );
+                        break;
+                    }
+                    // 保存第一个找到的作为备用
+                    if mouflon_psch.is_none() {
+                        mouflon_psch = Some(psch);
+                        mouflon_pkey = Some(pkey);
+                        debug!(
+                            "[{}] 从主播放列表提取 MOUFLON (备用): psch={}, pkey={}",
+                            self.config.username, segments[2], segments[3]
+                        );
+                    }
                 }
             }
         }
@@ -1201,8 +1231,8 @@ impl StripChatRecorder {
         let decryption_key = match decryption_key {
             Some(key) => key,
             None => {
-                debug!(
-                    "[{}] 未发现MOUFLON参数或无法获取解密密钥，返回原始内容",
+                warn!(
+                    "[{}] 未发现已知的MOUFLON解密密钥，录制可能失败。如需添加自定义密钥，请在 config.json 中设置 mouflon_keys 字段",
                     username
                 );
                 return content.to_string();
@@ -1280,7 +1310,7 @@ impl StripChatRecorder {
         decoded.join("\n")
     }
 
-    /// 提取MOUFLON参数 - 改进版，支持多个MOUFLON头并返回解密密钥
+    /// 提取MOUFLON参数 - 与 StreaMonitor 一致：遍历所有 PSCH 头，优先返回有已知密钥的
     ///
     /// 重要说明：pkey 不是解密密钥，而是密钥的 ID！
     /// 需要通过 mouflon_keys 映射查找实际的解密密钥。
@@ -1292,45 +1322,31 @@ impl StripChatRecorder {
         let needle = "#EXT-X-MOUFLON:PSCH:";
         let mut start = 0;
 
-        // 遍历内容查找所有MOUFLON PSCH头
+        // 第一次遍历：查找有已知密钥映射的 pkey
         while let Some(pos) = content[start..].find(needle) {
             let mouflon_start = start + pos;
             if let Some(line_end) = content[mouflon_start..].find('\n') {
                 let line = &content[mouflon_start..mouflon_start + line_end];
-                // 格式: #EXT-X-MOUFLON:PSCH:v1:Zeechoej4aleeshi
-                // parts[0] = "#EXT-X-MOUFLON"
-                // parts[1] = "PSCH"
-                // parts[2] = "v1" (scheme)
-                // parts[3] = "Zeechoej4aleeshi" (key ID, 不是实际密钥!)
                 let parts: Vec<&str> = line.split(':').collect();
 
                 if parts.len() >= 4 {
                     let psch = parts[2].to_string();
                     let pkey = parts[3].to_string();
 
-                    // 从映射中查找实际的解密密钥
-                    // pkey 是密钥 ID，需要查找对应的实际密钥
-                    let decryption_key = mouflon_keys.get(&pkey).cloned().unwrap_or_else(|| {
-                        // 如果映射中没有找到，记录警告并尝试使用 pkey 本身
-                        // （这可能不会工作，但至少可以继续运行）
+                    if let Some(decryption_key) = mouflon_keys.get(&pkey).cloned() {
                         debug!(
-                            "未在密钥映射中找到 pkey '{}' 的实际密钥，尝试使用 pkey 本身",
-                            pkey
+                            "MOUFLON: psch={}, pkey={}, decryption_key={}",
+                            psch, pkey, decryption_key
                         );
-                        pkey.clone()
-                    });
-
-                    debug!(
-                        "MOUFLON: psch={}, pkey={}, decryption_key={}",
-                        psch, pkey, decryption_key
-                    );
-
-                    return (Some(psch), Some(pkey), Some(decryption_key));
+                        return (Some(psch), Some(pkey), Some(decryption_key));
+                    }
                 }
             }
             start = mouflon_start + needle.len();
         }
 
+        // 如果没有找到已知密钥，返回 None（让调用者决定如何处理）
+        debug!("未找到有已知密钥映射的 MOUFLON pkey，跳过解密");
         (None, None, None)
     }
 
