@@ -4,11 +4,12 @@ resolver = "3"
 
 [workspace.dependencies]
 screc-core = { path = "crates/screc-core" }
-tokio = { version = "1.52.1", features = [
+tokio = { version = "1.52.3", features = [
     "rt-multi-thread",
     "macros",
     "time",
     "sync",
+    "process",
 ] }
 anyhow = "1.0.102"
 log = "0.4.29"

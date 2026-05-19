@@ -148,12 +148,12 @@ async fn run_gui_mode(app_config: AppConfig, config_path: PathBuf) -> Result<()>
         gui_state.clone(),
     ));
 
-    // 运行 GUI（阻塞主线程）
+    // 运行 GUI（阻塞主线程，窗口关闭拦截和停止录制由 GUI 内部处理）
     gui::run_gui(gui_state);
 
-    info!("GUI 已关闭，正在关闭所有录制任务...");
+    // GUI 已关闭，发送关闭信号确保管理器退出
+    info!("GUI 已关闭，发送关闭信号...");
     let _ = shutdown_tx.send(());
-    info!("已发送关闭信号，等待任务完成...");
 
     if let Err(e) = manager_handle.await {
         error!("模特管理任务崩溃: {}", e);
@@ -258,10 +258,20 @@ async fn run_model_manager(
                     }
                     Some(ModelCommand::StopAll) => {
                         info!("停止所有录制任务，共 {} 个", active.len());
-                        for (username, (tx, _)) in active.drain() {
+                        let mut handles = Vec::new();
+                        for (username, (tx, handle)) in active.drain() {
                             info!("停止用户 {} 的录制", username);
                             let _ = tx.send(());
+                            handles.push(handle);
                         }
+                        // 等待所有录制任务完成（包括 ffmpeg 转换等录制结束流程）
+                        let timeout = tokio::time::Duration::from_secs(60);
+                        let _ = tokio::time::timeout(timeout, async {
+                            for handle in handles {
+                                let _ = handle.await;
+                            }
+                        })
+                        .await;
                     }
                     None => break,
                 }

@@ -1,20 +1,47 @@
 use anyhow::{Result, anyhow};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use reqwest::Client;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use tokio::fs::File;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::broadcast;
 use url::Url;
 
+/// 每 N 个分片后执行一次 flush（减少磁盘同步开销）
+const FLUSH_INTERVAL: usize = 10;
+/// 空播放列表连续出现多少次后认为直播结束
+const MAX_EMPTY_PLAYLISTS: u32 = 10;
+/// 单个分片最大失败次数（跨多轮播放列表），超过后放弃该分片
+const MAX_SEGMENT_FAILURES: u32 = 5;
+/// 单个分片单次下载超时（秒）
+const SEGMENT_DOWNLOAD_TIMEOUT_SECS: u64 = 30;
+/// 有效分片的最小字节数（低于此值视为无效数据）
+const MIN_SEGMENT_SIZE: usize = 128;
+/// 连续 PendingRetry 轮次上限，防止 CDN 全面故障时无限自旋
+const MAX_CONSECUTIVE_PENDING_RETRIES: u32 = 20;
+
+/// 每轮播放列表处理的结果分类
+/// 用于主循环正确区分"真没新分片"和"有新分片但暂时下载失败"
+#[derive(Debug, PartialEq)]
+enum RoundOutcome {
+    /// 至少有一个分片成功下载并写入磁盘
+    DownloadedContent,
+    /// 播放列表中确实没有新分片（全部 URI 已知）
+    NoNewSegments,
+    /// 播放列表中有新分片但全部下载失败（将在下轮重试，不计入空轮计数）
+    PendingRetry,
+}
+
 pub struct HlsDownloader {
-    client: Client,                               // HTTP客户端
-    downloaded_segments: HashSet<String>,         // 已下载的分片集合
-    init_segment_downloaded: bool,                // 是否已下载初始化分片
-    shutdown_rx: Option<broadcast::Receiver<()>>, // 关闭信号接收器
-    username: String,                             // 用户名
-    total_processed_segments: usize,              // 已处理的分片总数
+    client: Client,                                // HTTP客户端
+    downloaded_segments: HashSet<String>,          // 已成功写入的分片集合
+    failed_segment_attempts: HashMap<String, u32>, // 失败分片的跨轮重试计数
+    init_segment_downloaded: bool,                 // 是否已下载初始化分片
+    shutdown_rx: Option<broadcast::Receiver<()>>,  // 关闭信号接收器
+    username: String,                              // 用户名
+    total_processed_segments: usize,               // 已处理的分片总数
+    segments_since_flush: usize,                   // 自上次 flush 以来的分片数
 }
 
 impl HlsDownloader {
@@ -23,10 +50,12 @@ impl HlsDownloader {
         Self {
             client,
             downloaded_segments: HashSet::new(),
+            failed_segment_attempts: HashMap::new(),
             init_segment_downloaded: false,
             shutdown_rx: None,
             username,
             total_processed_segments: 0,
+            segments_since_flush: 0,
         }
     }
 
@@ -84,7 +113,7 @@ impl HlsDownloader {
         }
     }
 
-    /// 下载 HLS 流
+    /// 下载 HLS 流（统一循环，消除代码重复）
     pub async fn download_hls_stream<F>(
         &mut self,
         playlist_url: &str,
@@ -96,137 +125,118 @@ impl HlsDownloader {
     {
         debug!("[{}] 开始 HLS 下载到: {:?}", self.username, output_path);
 
-        // 为原始 MP4 分片创建临时文件（fMP4）
+        // 为原始 MP4 分片创建临时文件（fMP4），使用 BufWriter 减少系统调用
         let temp_path = output_path.with_extension("tmp.mp4");
-        let mut output_file = File::create(&temp_path).await?;
-        let mut has_downloaded_content = false; // 跟踪是否实际下载了内容
+        let file = File::create(&temp_path).await?;
+        let mut output_file = BufWriter::with_capacity(256 * 1024, file); // 256KB 缓冲
+        let mut has_downloaded_content = false;
+        let mut consecutive_empty_playlists = 0u32;
+        let mut consecutive_pending_retries = 0u32; // PendingRetry 连续计数器
 
-        let mut consecutive_empty_playlists = 0;
-        const MAX_EMPTY_PLAYLISTS: u32 = 10; // 从3增加到10以提高稳定性
-        let mut dynamic_wait_time; // 基于分片目标持续时间的动态等待时间
+        // 计算动态等待时间的辅助函数
+        let calc_wait_time = |target_duration: u64| -> u64 {
+            if target_duration <= 2 {
+                1
+            } else if target_duration <= 6 {
+                target_duration / 2
+            } else {
+                3
+            }
+        };
 
-        let download_result = if let Some(ref mut shutdown_rx) = self.shutdown_rx {
-            let mut shutdown_rx = shutdown_rx.resubscribe();
+        // 统一循环：通过 Option<&mut broadcast::Receiver> 处理有无 shutdown 的情况
+        let mut shutdown_rx = self.shutdown_rx.as_mut().map(|rx| rx.resubscribe());
 
-            loop {
+        let download_result = 'main: loop {
+            // 根据是否有 shutdown_rx 选择不同的等待方式
+            let round_result = if let Some(ref mut rx) = shutdown_rx {
                 tokio::select! {
-                    result = self.download_playlist_segments(playlist_url, &mut output_file, m3u_processor) => {
-                        match result {
-                            Ok((has_new_content, target_duration)) => {
-                                // 基于分片目标持续时间更新动态等待时间
-                                dynamic_wait_time = if target_duration <= 2 {
-                                    1 // 对于短分片，每1秒检查一次
-                                } else if target_duration <= 6 {
-                                    target_duration / 2 // 对于中等分片，以一半持续时间检查
-                                } else {
-                                    3 // 对于长分片，每3秒检查一次
-                                };
-
-                                if has_new_content {
-                                    has_downloaded_content = true; // 标记已下载内容
-                                    consecutive_empty_playlists = 0;
-                                } else {
-                                    consecutive_empty_playlists += 1;
-                                    debug!("[{}] 播放列表中没有新分片 ({}/{})", self.username, consecutive_empty_playlists, MAX_EMPTY_PLAYLISTS);
-                                    if consecutive_empty_playlists >= MAX_EMPTY_PLAYLISTS {
-                                        info!(
-                                            "[{}] 连续 {} 次未发现新分片，直播可能已结束",
-                                            self.username, MAX_EMPTY_PLAYLISTS
-                                        );
-                                        break Ok(());
-                                    }
-                                    // 基于分片目标持续时间等待
-                                    debug!("[{}] 等待 {} 秒后重新检查播放列表", self.username, dynamic_wait_time);
-                                    if self.interruptible_sleep(tokio::time::Duration::from_secs(dynamic_wait_time)).await {
-                                        break Ok(());
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                error!("[{}] 下载分片时出错: {}", self.username, e);
-                                // 出错时不要立即放弃，等待并重试
-                                if self.interruptible_sleep(tokio::time::Duration::from_secs(3)).await {
-                                    break Ok(());
-                                }
-                                consecutive_empty_playlists += 1;
-                                if consecutive_empty_playlists >= MAX_EMPTY_PLAYLISTS {
-                                    break Err(e);
-                                }
-                            }
-                        }
-                    }
-                    _ = shutdown_rx.recv() => {
+                    r = self.download_playlist_segments(playlist_url, &mut output_file, m3u_processor) => r,
+                    _ = rx.recv() => {
                         info!("[{}] 收到关闭信号，停止下载新分片", self.username);
-                        break Ok(());
+                        break 'main Ok(());
                     }
                 }
-            }
-        } else {
-            // 没有关闭信号处理的原始循环
-            loop {
-                match self
-                    .download_playlist_segments(playlist_url, &mut output_file, m3u_processor)
+            } else {
+                self.download_playlist_segments(playlist_url, &mut output_file, m3u_processor)
                     .await
-                {
-                    Ok((has_new_content, target_duration)) => {
-                        // 基于分片目标持续时间更新动态等待时间
-                        dynamic_wait_time = if target_duration <= 2 {
-                            1 // 对于短分片，每1秒检查一次
-                        } else if target_duration <= 6 {
-                            target_duration / 2 // 对于中等分片，以一半持续时间检查
-                        } else {
-                            3 // 对于长分片，每3秒检查一次
-                        };
+            };
 
-                        if has_new_content {
-                            has_downloaded_content = true; // 标记已下载内容
-                            consecutive_empty_playlists = 0;
-                        } else {
-                            consecutive_empty_playlists += 1;
-                            debug!(
-                                "[{}] 播放列表中没有新分片 ({}/{})",
-                                self.username, consecutive_empty_playlists, MAX_EMPTY_PLAYLISTS
-                            );
-                            if consecutive_empty_playlists >= MAX_EMPTY_PLAYLISTS {
-                                info!(
-                                    "[{}] 连续 {} 次未发现新分片，直播可能已结束",
-                                    self.username, MAX_EMPTY_PLAYLISTS
-                                );
-                                break Ok(());
-                            }
-                            // 基于分片目标持续时间等待
-                            debug!(
-                                "[{}] 等待 {} 秒后重新检查播放列表",
-                                self.username, dynamic_wait_time
-                            );
-                            if self
-                                .interruptible_sleep(tokio::time::Duration::from_secs(
-                                    dynamic_wait_time,
-                                ))
-                                .await
-                            {
-                                break Ok(());
-                            }
-                        }
+            match round_result {
+                Ok((RoundOutcome::DownloadedContent, _)) => {
+                    // 成功获取内容：重置所有计数器，立即继续下一轮
+                    has_downloaded_content = true;
+                    consecutive_empty_playlists = 0;
+                    consecutive_pending_retries = 0;
+                    continue;
+                }
+                Ok((RoundOutcome::NoNewSegments, target_duration)) => {
+                    // 真没有新分片：计入空轮计数，重置 PendingRetry 计数
+                    consecutive_pending_retries = 0;
+                    consecutive_empty_playlists += 1;
+                    debug!(
+                        "[{}] 播放列表中没有新分片 ({}/{})",
+                        self.username, consecutive_empty_playlists, MAX_EMPTY_PLAYLISTS
+                    );
+                    if consecutive_empty_playlists >= MAX_EMPTY_PLAYLISTS {
+                        info!(
+                            "[{}] 连续 {} 次未发现新分片，直播可能已结束",
+                            self.username, MAX_EMPTY_PLAYLISTS
+                        );
+                        break 'main Ok(());
                     }
-                    Err(e) => {
-                        error!("[{}] 下载分片时出错: {}", self.username, e);
-                        // 出错时不要立即放弃，等待并重试
-                        if self
-                            .interruptible_sleep(tokio::time::Duration::from_secs(3))
-                            .await
-                        {
-                            break Err(e);
-                        }
-                        consecutive_empty_playlists += 1;
-                        if consecutive_empty_playlists >= MAX_EMPTY_PLAYLISTS {
-                            break Err(e);
-                        }
+                    let wait_time = calc_wait_time(target_duration);
+                    debug!("[{}] 等待 {} 秒后重新检查", self.username, wait_time);
+                    if self
+                        .interruptible_sleep(tokio::time::Duration::from_secs(wait_time))
+                        .await
+                    {
+                        break 'main Ok(());
+                    }
+                }
+                Ok((RoundOutcome::PendingRetry, _)) => {
+                    // 有分片但全部失败：不计入空轮计数，快速重试
+                    // 但连续 PendingRetry 过多说明 CDN 可能全面故障
+                    consecutive_pending_retries += 1;
+                    if consecutive_pending_retries >= MAX_CONSECUTIVE_PENDING_RETRIES {
+                        warn!(
+                            "[{}] 连续 {} 轮分片下载失败，CDN 可能不可用，停止下载",
+                            self.username, MAX_CONSECUTIVE_PENDING_RETRIES
+                        );
+                        break 'main Ok(());
+                    }
+                    debug!(
+                        "[{}] 分片下载暂时失败 (连续第 {} 轮)，1秒后重试",
+                        self.username, consecutive_pending_retries
+                    );
+                    if self
+                        .interruptible_sleep(tokio::time::Duration::from_secs(1))
+                        .await
+                    {
+                        break 'main Ok(());
+                    }
+                }
+                Err(e) => {
+                    // 播放列表获取失败（网络错误、HTTP 错误）：计入空轮计数
+                    error!("[{}] 下载轮次出错: {}", self.username, e);
+                    consecutive_empty_playlists += 1;
+                    if consecutive_empty_playlists >= MAX_EMPTY_PLAYLISTS {
+                        break 'main Err(e);
+                    }
+                    if self
+                        .interruptible_sleep(tokio::time::Duration::from_secs(3))
+                        .await
+                    {
+                        break 'main Ok(());
                     }
                 }
             }
         };
 
+        // 确保缓冲数据写入磁盘
+        if let Err(e) = output_file.flush().await {
+            error!("[{}] 刷新文件缓冲区失败: {}", self.username, e);
+        }
         drop(output_file);
 
         // 只有在实际下载了内容时才进行转换
@@ -235,33 +245,38 @@ impl HlsDownloader {
             match self.convert_ts_to_mp4(&temp_path, output_path).await {
                 Ok(()) => {
                     info!("[{}] 视频转换成功完成", self.username);
+                    // 转换成功，清理临时文件
+                    if let Err(e) = tokio::fs::remove_file(&temp_path).await {
+                        error!("[{}] 清理临时文件失败: {}", self.username, e);
+                    }
                 }
                 Err(e) => {
                     error!("[{}] 视频转换失败: {}", self.username, e);
-                    // 即使转换失败，我们仍然要清理并返回原始错误
+                    // 保留临时文件以便手动恢复
+                    warn!(
+                        "[{}] 原始数据已保留在: {:?}，可手动用 ffmpeg 修复",
+                        self.username, temp_path
+                    );
                 }
             }
         } else {
             debug!("[{}] 没有下载任何内容，跳过视频转换", self.username);
-        }
-
-        // 清理临时文件
-        if temp_path.exists()
-            && let Err(e) = tokio::fs::remove_file(&temp_path).await
-        {
-            error!("[{}] 清理临时文件失败: {}", self.username, e);
+            // 清理空临时文件
+            if let Err(e) = tokio::fs::remove_file(&temp_path).await {
+                debug!("[{}] 清理空临时文件失败: {}", self.username, e);
+            }
         }
 
         download_result
     }
 
-    /// 下载播放列表分片
+    /// 下载播放列表分片（单线程顺序下载）
     async fn download_playlist_segments<F>(
         &mut self,
         playlist_url: &str,
-        output_file: &mut File,
+        output_file: &mut BufWriter<File>,
         m3u_processor: Option<&F>,
-    ) -> Result<(bool, u64)>
+    ) -> Result<(RoundOutcome, u64)>
     where
         F: Fn(&str) -> String,
     {
@@ -300,8 +315,9 @@ impl HlsDownloader {
             );
         }
 
-        let mut has_new_content = false; // 跟踪任何新内容（初始化分片或媒体分片）
-        let mut target_duration = 6; // 默认分片目标持续时间，将从播放列表更新
+        let mut target_duration = 6u64;
+        let mut init_failed = false; // 初始化分片是否下载失败
+        let mut init_just_downloaded = false; // 本轮是否刚下载了初始化分片
 
         // 从 M3U8 内容提取分片目标持续时间
         for line in content.lines() {
@@ -317,20 +333,25 @@ impl HlsDownloader {
             }
         }
 
-        // 检查 #EXT-X-MAP 初始化分片
+        // 检查 #EXT-X-MAP 初始化分片（必须在媒体分片之前）
         if !self.init_segment_downloaded
             && let Some(init_url) = self.extract_init_segment(&content, playlist_url)?
         {
             debug!("[{}] 下载初始化分片: {}", self.username, init_url);
-            match self.download_segment(&init_url, output_file).await {
-                Ok(()) => {
-                    debug!("[{}] 初始化分片下载成功", self.username);
+            match self.download_with_retry(&init_url).await {
+                Ok(data) => {
+                    output_file.write_all(&data).await?;
                     self.init_segment_downloaded = true;
-                    has_new_content = true; // 标记已下载初始化分片
+                    init_just_downloaded = true;
+                    debug!(
+                        "[{}] 初始化分片下载成功 ({} 字节)",
+                        self.username,
+                        data.len()
+                    );
                 }
                 Err(e) => {
                     error!("[{}] 初始化分片下载失败: {}", self.username, e);
-                    return Err(e);
+                    init_failed = true;
                 }
             }
         }
@@ -340,110 +361,185 @@ impl HlsDownloader {
 
         match playlist {
             m3u8_rs::Playlist::MediaPlaylist(media_playlist) => {
-                debug!(
-                    "[{}] 播放列表包含 {} 个分片",
-                    self.username,
-                    media_playlist.segments.len()
-                );
                 let base_url = Url::parse(playlist_url)?;
 
-                // 统计我们尚未下载的新分片
-                let new_segments: Vec<_> = media_playlist
+                // 收集新分片信息：(segment_url, segment_uri)
+                let new_segments: Vec<(String, String)> = media_playlist
                     .segments
                     .iter()
-                    .filter(|segment| !self.downloaded_segments.contains(&segment.uri))
+                    .filter(|seg| !self.downloaded_segments.contains(&seg.uri))
+                    .map(|seg| {
+                        let url = if seg.uri.starts_with("http") {
+                            seg.uri.clone()
+                        } else {
+                            // join 失败时回退到原始 uri
+                            base_url
+                                .join(&seg.uri)
+                                .map(|u| u.to_string())
+                                .unwrap_or_else(|_| seg.uri.clone())
+                        };
+                        (url, seg.uri.clone())
+                    })
                     .collect();
-                let new_segments_count = new_segments.len();
-                let total_segments_in_this_round =
-                    self.total_processed_segments + new_segments_count;
 
-                let mut current_new_segment_index = 0;
-
-                for segment in &media_playlist.segments {
-                    let segment_uri = &segment.uri;
-
-                    if self.downloaded_segments.contains(segment_uri) {
-                        debug!("[{}] 分片已下载，跳过: {}", self.username, segment_uri);
-                        continue;
-                    }
-
-                    current_new_segment_index += 1;
-                    self.total_processed_segments += 1;
-
-                    let segment_url = if segment_uri.starts_with("http") {
-                        segment_uri.clone()
+                if new_segments.is_empty() {
+                    debug!("[{}] 播放列表中没有新分片", self.username);
+                    let outcome = if init_failed {
+                        RoundOutcome::PendingRetry
+                    } else if init_just_downloaded {
+                        // 刚下载了 init 分片但还没有媒体分片，算作有内容
+                        RoundOutcome::DownloadedContent
                     } else {
-                        base_url.join(segment_uri)?.to_string()
+                        RoundOutcome::NoNewSegments
                     };
+                    return Ok((outcome, target_duration));
+                }
 
-                    debug!(
-                        "[{}] 下载新分片 ({}/{}): {}",
-                        self.username, current_new_segment_index, new_segments_count, segment_url
+                // 如果初始化分片失败，跳过媒体分片处理（fMP4 需要 init 在前）
+                if init_failed {
+                    warn!(
+                        "[{}] 初始化分片未就绪，暂缓处理 {} 个媒体分片",
+                        self.username,
+                        new_segments.len()
                     );
+                    return Ok((RoundOutcome::PendingRetry, target_duration));
+                }
 
-                    // 添加正确索引的信息级进度消息
-                    info!(
-                        "[{}] 正在处理分片 {}/{}",
-                        self.username, self.total_processed_segments, total_segments_in_this_round
-                    );
+                let new_count = new_segments.len();
+                debug!(
+                    "[{}] 发现 {} 个新分片，顺序下载中…",
+                    self.username, new_count
+                );
 
-                    // 尝试下载分片，但不因单个分片而使整个过程失败
-                    match self.download_segment(&segment_url, output_file).await {
-                        Ok(()) => {
-                            self.downloaded_segments.insert(segment_uri.clone());
-                            has_new_content = true; // 标记已下载媒体分片
+                // 顺序下载所有分片（单线程，保证写入顺序）
+                let mut any_succeeded = false;
+                let mut any_failed_pending = false;
+                let total_visible = self.total_processed_segments + new_count;
+
+                for (seg_url, seg_uri) in &new_segments {
+                    let result = self.download_with_retry(seg_url).await;
+
+                    match &result {
+                        Ok(data) if data.is_empty() => {
+                            // 404/403：分片已过期，永久跳过
+                            debug!("[{}] 分片 {} 不可用，永久跳过", self.username, seg_uri);
+                            self.downloaded_segments.insert(seg_uri.clone());
+                            self.failed_segment_attempts.remove(seg_uri);
+                        }
+                        Ok(data) => {
+                            // 有效数据：写入磁盘（try_download_segment_data 已校验完整性）
+                            info!(
+                                "[{}] 正在处理分片 {}/{} ({} 字节)",
+                                self.username,
+                                self.total_processed_segments + 1,
+                                total_visible,
+                                data.len()
+                            );
+                            output_file.write_all(data).await?;
+                            self.total_processed_segments += 1;
+                            self.segments_since_flush += 1;
+                            if self.segments_since_flush >= FLUSH_INTERVAL {
+                                output_file.flush().await?;
+                                self.segments_since_flush = 0;
+                            }
+                            self.downloaded_segments.insert(seg_uri.clone());
+                            self.failed_segment_attempts.remove(seg_uri);
+                            any_succeeded = true;
                         }
                         Err(e) => {
-                            // 记录错误但继续处理其他分片
-                            // 其中单个分片失败不会停止整个下载过程
-                            error!("[{}] 下载分片 {} 失败: {}", self.username, segment_url, e);
-                            // 仍标记为"已处理"以避免对坏分片无限重试
-                            self.downloaded_segments.insert(segment_uri.clone());
+                            let attempts = self
+                                .failed_segment_attempts
+                                .entry(seg_uri.clone())
+                                .and_modify(|c| *c += 1)
+                                .or_insert(1);
+
+                            if *attempts >= MAX_SEGMENT_FAILURES {
+                                // 超过最大重试次数：永久放弃，该位置将产生空隙
+                                error!(
+                                    "[{}] 分片 {} 已失败 {} 次，放弃重试（该位置将产生空隙）: {}",
+                                    self.username, seg_uri, attempts, e
+                                );
+                                self.downloaded_segments.insert(seg_uri.clone());
+                                self.failed_segment_attempts.remove(seg_uri);
+                            } else {
+                                // 仍可重试：本轮停止，下轮重试
+                                warn!(
+                                    "[{}] 分片 {} 下载失败 (第 {} 次)，本轮停止: {}",
+                                    self.username, seg_uri, attempts, e
+                                );
+                                any_failed_pending = true;
+                                break;
+                            }
                         }
                     }
                 }
 
-                if new_segments_count > 0 {
-                    debug!("[{}] 处理了 {} 个新分片", self.username, new_segments_count);
+                let outcome = if any_succeeded {
+                    RoundOutcome::DownloadedContent
+                } else if any_failed_pending {
+                    RoundOutcome::PendingRetry
                 } else {
-                    debug!("[{}] 播放列表中没有新分片", self.username);
-                }
+                    RoundOutcome::NoNewSegments
+                };
+
+                debug!(
+                    "[{}] 本轮结果: {:?} ({} 个分片)",
+                    self.username, outcome, new_count
+                );
+                return Ok((outcome, target_duration));
             }
             m3u8_rs::Playlist::MasterPlaylist(_) => {
                 return Err(anyhow!("此上下文不支持主播放列表"));
             }
         }
-
-        Ok((has_new_content, target_duration))
     }
 
-    /// 下载单个分片
-    async fn download_segment(&self, segment_url: &str, output_file: &mut File) -> Result<()> {
+    /// 带重试和超时的单个分片下载
+    async fn download_with_retry(&self, segment_url: &str) -> Result<Vec<u8>> {
         const MAX_RETRIES: u32 = 3;
-        let mut retries = 0;
+        let mut last_error = None;
 
-        loop {
-            match self.try_download_segment(segment_url, output_file).await {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    retries += 1;
-                    if retries >= MAX_RETRIES {
-                        return Err(e);
-                    }
+        for attempt in 0..MAX_RETRIES {
+            // 每次尝试都有独立超时
+            let download_future = self.try_download_segment_data(segment_url);
 
-                    debug!(
-                        "[{}] 分片下载失败 (尝试 {}/{}): {}，正在重试...",
-                        self.username, retries, MAX_RETRIES, e
-                    );
-                    tokio::time::sleep(tokio::time::Duration::from_millis(1000 * retries as u64))
-                        .await;
+            match tokio::time::timeout(
+                tokio::time::Duration::from_secs(SEGMENT_DOWNLOAD_TIMEOUT_SECS),
+                download_future,
+            )
+            .await
+            {
+                Ok(Ok(data)) => return Ok(data),
+                Ok(Err(e)) => {
+                    last_error = Some(e);
+                }
+                Err(_elapsed) => {
+                    last_error = Some(anyhow!(
+                        "分片下载超时 ({}秒)",
+                        SEGMENT_DOWNLOAD_TIMEOUT_SECS
+                    ));
                 }
             }
+
+            if attempt + 1 < MAX_RETRIES {
+                let delay_ms = 500 * (attempt + 1) as u64;
+                debug!(
+                    "[{}] 分片下载失败 (尝试 {}/{}): {}，{}ms 后重试...",
+                    self.username,
+                    attempt + 1,
+                    MAX_RETRIES,
+                    last_error.as_ref().unwrap(),
+                    delay_ms
+                );
+                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+            }
         }
+
+        Err(last_error.unwrap())
     }
 
-    /// 尝试下载分片（带重试机制）
-    async fn try_download_segment(&self, segment_url: &str, output_file: &mut File) -> Result<()> {
+    /// 下载单个分片的原始数据
+    async fn try_download_segment_data(&self, segment_url: &str) -> Result<Vec<u8>> {
         let response = self
             .client
             .get(segment_url)
@@ -459,36 +555,30 @@ impl HlsDownloader {
 
         // 处理特定的 HTTP 状态码
         match response.status() {
-            reqwest::StatusCode::OK => {
-                // 成功，继续下载
-            }
+            reqwest::StatusCode::OK => {}
             reqwest::StatusCode::IM_A_TEAPOT => {
-                // "I'm a teapot" - CDN 经常使用这个状态码表示
-                // 分片尚未准备好或暂时不可用
+                // 418 = CDN 分片尚未就绪，应触发重试（而非永久跳过）
                 debug!(
-                    "[{}] 分片 {} 返回 418 (teapot)，跳过",
+                    "[{}] 分片 {} 返回 418 (teapot)，CDN 分片尚未就绪，将重试",
                     self.username, segment_url
                 );
-                return Ok(()); // 跳过此分片，不作为错误处理
+                return Err(anyhow!("分片尚未就绪 (418)，将重试"));
             }
             reqwest::StatusCode::NOT_FOUND => {
-                // 分片未找到，可能已过期或尚不可用
                 debug!(
                     "[{}] 分片 {} 未找到 (404)，跳过",
                     self.username, segment_url
                 );
-                return Ok(());
+                return Ok(Vec::new());
             }
             reqwest::StatusCode::FORBIDDEN => {
-                // 禁止访问，可能由于频率限制或访问限制
                 debug!(
                     "[{}] 分片 {} 被禁止访问 (403)，跳过",
                     self.username, segment_url
                 );
-                return Ok(());
+                return Ok(Vec::new());
             }
             reqwest::StatusCode::TOO_MANY_REQUESTS => {
-                // 请求过多 - 应该延迟后重试
                 return Err(anyhow!("请求过于频繁 (429)，将重试"));
             }
             status => {
@@ -500,48 +590,100 @@ impl HlsDownloader {
             }
         }
 
-        let bytes = response.bytes().await?;
-        if bytes.is_empty() {
-            debug!("[{}] 分片 {} 为空，跳过", self.username, segment_url);
-            return Ok(());
+        // 验证 Content-Type 是否为视频/二进制数据（CDN 可能返回 HTML 错误页）
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if content_type.to_lowercase().contains("text/html") {
+            warn!(
+                "[{}] 分片 {} 返回 HTML 而非视频数据，将重试",
+                self.username, segment_url
+            );
+            return Err(anyhow!("分片返回了 HTML 而非视频数据"));
         }
 
-        output_file.write_all(&bytes).await?;
-        output_file.flush().await?;
+        // 记录 Content-Length 用于校验
+        let expected_len = response
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<usize>().ok());
+
+        let bytes = response.bytes().await?;
+        let actual_len = bytes.len();
+
+        // 校验下载数据完整性
+        if actual_len < MIN_SEGMENT_SIZE {
+            if actual_len == 0 {
+                warn!(
+                    "[{}] 分片 {} 下载为空 (0 字节)，将重试",
+                    self.username, segment_url
+                );
+                return Err(anyhow!("分片下载数据为空"));
+            }
+            warn!(
+                "[{}] 分片 {} 数据过小 ({} 字节 < {})，将重试",
+                self.username, segment_url, actual_len, MIN_SEGMENT_SIZE
+            );
+            return Err(anyhow!("分片数据过小: {} 字节", actual_len));
+        }
+
+        if let Some(expected) = expected_len {
+            if actual_len != expected {
+                warn!(
+                    "[{}] 分片 {} 数据不完整 (期望 {} 字节，实际 {} 字节)，将重试",
+                    self.username, segment_url, expected, actual_len
+                );
+                return Err(anyhow!(
+                    "分片数据不完整: 期望 {} 字节，实际 {} 字节",
+                    expected,
+                    actual_len
+                ));
+            }
+        }
+
         debug!(
             "[{}] 分片下载成功: {} ({} 字节)",
-            self.username,
-            segment_url,
-            bytes.len()
+            self.username, segment_url, actual_len
         );
 
-        Ok(())
+        Ok(bytes.to_vec())
     }
 
-    /// 使用 FFmpeg 将 fMP4 转换为 MP4
+    /// 使用 FFmpeg 将 fMP4 转换为 MP4（异步，不阻塞 tokio 工作线程）
     async fn convert_ts_to_mp4(&self, input_path: &Path, output_path: &Path) -> Result<()> {
         use std::process::Command;
 
-        debug!("[{}] 使用 FFmpeg 将 fMP4 转换为 MP4...", self.username);
+        info!("[{}] 使用 FFmpeg 将 fMP4 转换为 MP4...", self.username);
 
-        let mut cmd = Command::new("ffmpeg");
-        cmd.arg("-i")
+        let mut std_cmd = Command::new("ffmpeg");
+        std_cmd
+            .arg("-fflags")
+            .arg("+genpts+igndts")
+            .arg("-i")
             .arg(input_path)
             .arg("-c:a")
             .arg("copy")
             .arg("-c:v")
             .arg("copy")
-            .arg("-y") // 覆盖输出文件
+            .arg("-movflags")
+            .arg("+faststart")
+            .arg("-y")
             .arg(output_path);
 
-        // Windows GUI 模式下隐藏 ffmpeg 控制台窗口
+        // Windows GUI 模式下隐藏 ffmpeg 控制台窗口，并使其脱离父进程生命周期
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            // CREATE_NO_WINDOW | DETACHED_PROCESS
+            std_cmd.creation_flags(0x08000000 | 0x00000008);
         }
 
-        let output = cmd.output().map_err(|e| {
+        let mut cmd = tokio::process::Command::from(std_cmd);
+
+        let output = cmd.output().await.map_err(|e| {
             anyhow!(
                 "运行 FFmpeg 失败: {}。请确保 FFmpeg 已安装并在 PATH 中。",
                 e
