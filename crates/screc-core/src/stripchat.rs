@@ -124,6 +124,7 @@ pub struct StripChatRecorder {
     status: StreamStatus,                                    // 流状态
     shutdown_rx: Option<broadcast::Receiver<()>>,            // 关闭信号接收器
     mouflon_keys: std::collections::HashMap<String, String>, // MOUFLON密钥缓存
+    user_id_cache: HashMap<String, i64>,                     // 用户名 -> 用户ID 缓存
     callback: Option<Arc<dyn RecorderCallback>>,             // 外部回调（如 GUI）
 }
 
@@ -191,6 +192,7 @@ impl StripChatRecorder {
             status: StreamStatus::Unknown,
             shutdown_rx: None,
             mouflon_keys,
+            user_id_cache: HashMap::new(),
             callback: None,
         };
 
@@ -225,6 +227,63 @@ impl StripChatRecorder {
                 chars[idx] as char
             })
             .collect()
+    }
+
+    /// 可中断的 GET 请求（支持关闭信号）
+    async fn interruptible_get(&mut self, url: &str) -> Result<reqwest::Response> {
+        if let Some(ref mut shutdown_rx) = self.shutdown_rx {
+            let mut shutdown_rx = shutdown_rx.resubscribe();
+            tokio::select! {
+                response = self.client.get(url).send() => Ok(response?),
+                _ = shutdown_rx.recv() => {
+                    info!("[{}] 请求期间收到关闭信号", self.config.username);
+                    Err(anyhow!("收到关闭信号，中断请求"))
+                }
+            }
+        } else {
+            Ok(self.client.get(url).send().await?)
+        }
+    }
+
+    /// 通过用户名解析用户ID
+    ///
+    /// 2026-08 起 StripChat 将 `/api/front/v2/models/username/{username}/cam` 端点
+    /// 置于 Cloudflare 反机器人拦截（返回 HTTP 418），必须先通过
+    /// `/api/front/v2/users/username/{username}` 解析出用户ID，
+    /// 再使用 `/api/front/v2/models/{user_id}/cam` 查询状态（响应结构一致）。
+    ///
+    /// 返回 `Ok(None)` 表示用户不存在（HTTP 404）。用户ID在用户名修改后保持稳定，
+    /// 因此会缓存结果，避免每次轮询都重新解析。
+    async fn resolve_user_id(&mut self, username: &str) -> Result<Option<i64>> {
+        // 优先使用缓存
+        if let Some(cached) = self.user_id_cache.get(username) {
+            return Ok(Some(*cached));
+        }
+
+        let url = format!(
+            "https://stripchat.com/api/front/v2/users/username/{}",
+            username
+        );
+        debug!("[{}] 解析用户ID: {}", username, url);
+
+        let response = self.interruptible_get(&url).await?;
+        match response.status() {
+            reqwest::StatusCode::NOT_FOUND => {
+                debug!("[{}] 用户不存在 (HTTP 404)", username);
+                Ok(None)
+            }
+            status if !status.is_success() => Err(anyhow!("解析用户ID失败: HTTP {}", status)),
+            _ => {
+                let json: serde_json::Value = response.json().await?;
+                let user_id = json["item"]["id"]
+                    .as_i64()
+                    .or_else(|| json["item"]["id"].as_str().and_then(|s| s.parse().ok()))
+                    .ok_or_else(|| anyhow!("无法从响应中提取用户ID"))?;
+                self.user_id_cache.insert(username.to_string(), user_id);
+                debug!("[{}] 用户ID: {}", username, user_id);
+                Ok(Some(user_id))
+            }
+        }
     }
 
     /// 检查错误是否可重试
@@ -673,40 +732,83 @@ impl StripChatRecorder {
     }
 
     /// 内部状态检查实现
+    ///
+    /// 2026-08 起 StripChat 改用基于用户ID的 cam 端点：
+    /// 旧的 `/models/username/{username}/cam` 端点被 Cloudflare 拦截并返回 418，
+    /// 需先通过用户名解析用户ID（带缓存），再查询 cam 状态。
+    /// 响应结构与旧端点完全一致，下游解析逻辑无需改动。
     async fn check_status_internal(
         &mut self,
         previous_status: &mut StreamStatus,
     ) -> Result<StreamStatus> {
+        let username = self.config.username.clone();
+        // 每次检查生成随机 uniq 参数
         let uniq = Self::generate_uniq();
-        let url = format!(
-            "https://stripchat.com/api/front/v2/models/username/{}/cam?uniq={}",
-            self.config.username, uniq
+
+        // 解析用户ID（带缓存，避免每次轮询都重新解析）
+        let mut user_id = match self.resolve_user_id(&username).await {
+            Ok(Some(id)) => id,
+            Ok(None) => {
+                // 用户不存在
+                let status = StreamStatus::Offline;
+                info!("[{}] 状态: 离线 (用户不存在)", username);
+                if std::mem::discriminant(&status) != std::mem::discriminant(previous_status) {
+                    *previous_status = status.clone();
+                }
+                return Ok(status);
+            }
+            Err(e) => {
+                warn!("[{}] 解析用户ID失败: {}", username, e);
+                return Err(e);
+            }
+        };
+
+        let mut url = format!(
+            "https://stripchat.com/api/front/v2/models/{}/cam?uniq={}",
+            user_id, uniq
         );
-        debug!("[{}] 检查状态: {}", self.config.username, url);
+        debug!("[{}] 检查状态: {}", username, url);
 
         // 可中断的网络请求
-        let response = if let Some(ref mut shutdown_rx) = self.shutdown_rx {
-            let mut shutdown_rx = shutdown_rx.resubscribe();
-            tokio::select! {
-                response = self.client.get(&url).send() => response?,
-                _ = shutdown_rx.recv() => {
-                    info!("[{}] 状态检查期间收到关闭信号", self.config.username);
-                    return Err(anyhow!("收到关闭信号，中断状态检查"));
-                }
+        let mut response = self.interruptible_get(&url).await?;
+
+        // 404: 模型不存在或已重命名 → 使ID缓存失效并重新解析一次
+        //（用户ID在用户名修改后保持稳定，重试可应对刚改名的场景）
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            self.user_id_cache.remove(&username);
+            if let Ok(Some(new_id)) = self.resolve_user_id(&username).await
+                && new_id != user_id
+            {
+                user_id = new_id;
+                url = format!(
+                    "https://stripchat.com/api/front/v2/models/{}/cam?uniq={}",
+                    user_id, uniq
+                );
+                debug!("[{}] 用户ID已更新，重新检查状态: {}", username, url);
+                response = self.interruptible_get(&url).await?;
             }
-        } else {
-            self.client.get(&url).send().await?
-        };
+            // 重新解析失败或 ID 未变化时，保持原始 404 响应，走下方 NOT_FOUND 分支
+        }
 
         let api_response: ApiResponse = match response.status() {
             reqwest::StatusCode::NOT_FOUND => {
                 let status = StreamStatus::Offline;
-                info!("[{}] 状态: 离线 (用户不存在)", self.config.username);
+                info!("[{}] 状态: 离线 (用户不存在)", username);
                 // 只在状态变化时更新 previous_status
                 if std::mem::discriminant(&status) != std::mem::discriminant(previous_status) {
                     *previous_status = status.clone();
                 }
                 return Ok(status);
+            }
+            reqwest::StatusCode::IM_A_TEAPOT => {
+                // Cloudflare 反机器人拦截（新端点一般不会出现，保留以便诊断）
+                warn!("[{}] 状态检查被 Cloudflare 拦截 (HTTP 418)", username);
+                let error_status = StreamStatus::Error;
+                if std::mem::discriminant(&error_status) != std::mem::discriminant(previous_status)
+                {
+                    *previous_status = error_status.clone();
+                }
+                return Err(anyhow!("API 请求被 Cloudflare 拦截: HTTP 418"));
             }
             status if !status.is_success() => {
                 // 检查是否为认证相关错误
@@ -715,21 +817,19 @@ impl StripChatRecorder {
                 {
                     warn!(
                         "[{}] 检测到认证错误 (HTTP {}), 尝试刷新cookies",
-                        self.config.username, status
+                        username, status
                     );
 
                     // 尝试刷新cookies
-                    if let Err(e) =
-                        Self::refresh_cookies_only(&self.client, &self.config.username).await
-                    {
-                        debug!("[{}] Cookie刷新失败: {}", self.config.username, e);
+                    if let Err(e) = Self::refresh_cookies_only(&self.client, &username).await {
+                        debug!("[{}] Cookie刷新失败: {}", username, e);
                     }
 
                     return Err(anyhow!("认证失败，已尝试刷新cookies: HTTP {}", status));
                 }
 
                 let error_status = StreamStatus::Error;
-                error!("[{}] 状态: 错误 (HTTP {})", self.config.username, status);
+                error!("[{}] 状态: 错误 (HTTP {})", username, status);
                 // 只在状态变化时更新 previous_status
                 if std::mem::discriminant(&error_status) != std::mem::discriminant(previous_status)
                 {
@@ -1006,18 +1106,7 @@ impl StripChatRecorder {
         debug!("[{}] 获取主播放列表: {}", self.config.username, master_url);
 
         // 可中断的网络请求
-        let response = if let Some(ref mut shutdown_rx) = self.shutdown_rx {
-            let mut shutdown_rx = shutdown_rx.resubscribe();
-            tokio::select! {
-                response = self.client.get(&master_url).send() => response?,
-                _ = shutdown_rx.recv() => {
-                    info!("[{}] 获取播放列表期间收到关闭信号", self.config.username);
-                    return Err(anyhow!("收到关闭信号，中断播放列表获取"));
-                }
-            }
-        } else {
-            self.client.get(&master_url).send().await?
-        };
+        let response = self.interruptible_get(&master_url).await?;
 
         if !response.status().is_success() {
             return Err(anyhow!("获取主播放列表失败: {}", response.status()));

@@ -6,7 +6,7 @@ use gpui::AppContext as _;
 use gpui::*;
 use gpui::{Pixels, Size};
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::setting::{
     NumberFieldOptions, SettingField, SettingGroup, SettingItem, SettingPage, Settings,
@@ -813,16 +813,15 @@ impl AppView {
                                 gui.with_app_config(|c| SharedString::from(c.get_user_agent()));
                             let state_key = format!(
                                 "ua-field-p{}g{}i{}",
-                                options.page_ix, options.group_ix, options.item_ix
+                                options.page_ix(),
+                                options.group_ix(),
+                                options.item_ix()
                             );
 
                             let state = window
                                 .use_keyed_state(SharedString::from(state_key), cx, |window, cx| {
                                     let input = cx.new(|cx| {
-                                        InputState::new(window, cx)
-                                            .multi_line(true)
-                                            .rows(3)
-                                            .default_value(ua)
+                                        TextareaState::new(window, cx).rows(3).default_value(ua)
                                     });
                                     let g = gui.clone();
                                     let _sub = cx.subscribe(
@@ -846,7 +845,7 @@ impl AppView {
                                 .read(cx);
 
                             let (input, _) = state;
-                            Input::new(input).w_full().h(px(72.)).into_any_element()
+                            Textarea::new(input).w_full().h(px(72.)).into_any_element()
                         }
                     }),
                 )
@@ -866,14 +865,15 @@ impl AppView {
                             });
                             let state_key = format!(
                                 "cookies-field-p{}g{}i{}",
-                                options.page_ix, options.group_ix, options.item_ix
+                                options.page_ix(),
+                                options.group_ix(),
+                                options.item_ix()
                             );
 
                             let state = window
                                 .use_keyed_state(SharedString::from(state_key), cx, |window, cx| {
                                     let input = cx.new(|cx| {
-                                        InputState::new(window, cx)
-                                            .multi_line(true)
+                                        TextareaState::new(window, cx)
                                             .rows(4)
                                             .placeholder("输入 Cookie 字符串...")
                                             .default_value(cookies)
@@ -906,7 +906,7 @@ impl AppView {
                                 .read(cx);
 
                             let (input, _) = state;
-                            Input::new(input)
+                            Textarea::new(input)
                                 .disabled(recording_active)
                                 .w_full()
                                 .h(px(100.))
