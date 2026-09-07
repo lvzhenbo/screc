@@ -1,6 +1,5 @@
 # Rust build files
 /target/
-Cargo.lock
 
 # IDE files
 .vscode/

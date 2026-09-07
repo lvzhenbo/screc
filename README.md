@@ -8,7 +8,7 @@
 
 - 🎥 **直播间监控** — 自动检测 StripChat 主播直播状态
 - 📹 **在线自动录制** — 检测到公开直播时立即开始录制
-- 🖥️ **原生 GUI** — 基于 [GPUI](https://github.com/zed-industries/zed) 的桌面客户端，支持实时状态监控、模特管理和日志查看
+- 🖥️ **原生 GUI** — 基于 [GPUI Kit](https://github.com/longbridge/gpui-kit) 的桌面客户端，支持实时状态监控、模特管理和日志查看
 - 🔄 **中断重试** — 网络错误和分片失败时自动重试
 - 👥 **多用户并发** — 同时监控和录制多个主播
 - 🔐 **加密流解密** — 支持 MOUFLON 加密流的自动解密（含多头处理）
@@ -21,7 +21,7 @@
 
 ## 系统要求
 
-- **Rust** 1.82+（Rust 2024 Edition）
+- **Rust** 最新 stable 工具链（Rust 2024 Edition）
 - **FFmpeg** — 用于视频格式转换，需在 PATH 中
 - **网络连接** — 访问 StripChat API 和视频流
 
@@ -216,7 +216,7 @@ logs/screc-YYYY-MM-DD-HH-MM-SS.log                   # 日志文件
 
 | 问题         | 解决方案                                 |
 | ------------ | ---------------------------------------- |
-| 编译失败     | 升级 Rust 至 1.82+（Rust 2024 Edition）  |
+| 编译失败     | 运行 `rustup update stable` 更新 Rust 工具链 |
 | FFmpeg 错误  | 安装 FFmpeg 并添加到 PATH                |
 | 网络连接失败 | 检查网络，配置代理                       |
 | API 访问失败 | 更换代理或稍后重试                       |
@@ -235,7 +235,7 @@ logs/screc-YYYY-MM-DD-HH-MM-SS.log                   # 日志文件
 | `m3u8-rs`                 | M3U8 播放列表解析                                        |
 | `sha2` / `base64`         | 加密流解密                                               |
 | `fern` / `log`            | 日志系统                                                 |
-| `gpui` / `gpui-component` | GUI 框架（[Zed](https://github.com/zed-industries/zed)） |
+| `gpui-kit` 0.6 | GUI 框架、组件和图标资源（[GPUI Kit](https://github.com/longbridge/gpui-kit)），统一管理匹配的 GPUI 依赖 |
 
 ## 许可证
 

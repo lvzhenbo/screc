@@ -2,21 +2,21 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use chrono::Local;
-use gpui::AppContext as _;
-use gpui::*;
-use gpui::{Pixels, Size};
-use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
-use gpui_component::scroll::ScrollableElement as _;
-use gpui_component::setting::{
+use gpui_kit::AppContext as _;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::setting::{
     NumberFieldOptions, SettingField, SettingGroup, SettingItem, SettingPage, Settings,
 };
-use gpui_component::switch::Switch;
-use gpui_component::tab::{Tab, TabBar};
-use gpui_component::table::{TableBody, TableCell, TableHead, TableHeader, TableRow};
-use gpui_component::tag::Tag;
-use gpui_component::tooltip::Tooltip;
-use gpui_component::*;
+use gpui_kit::component::switch::Switch;
+use gpui_kit::component::tab::{Tab, TabBar};
+use gpui_kit::component::table::{TableBody, TableCell, TableHead, TableHeader, TableRow};
+use gpui_kit::component::tag::Tag;
+use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::component::*;
+use gpui_kit::*;
+use gpui_kit::{Pixels, Size};
 
 use screc_core::config::AppConfig;
 
@@ -1253,18 +1253,18 @@ impl Render for AppView {
 
 /// 启动 GUI 窗口（阻塞调用，在主线程运行）
 pub fn run_gui(gui_state: SharedGuiState) {
-    let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
+    let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
 
     app.run(move |cx: &mut App| {
-        gpui_component::set_locale("zh-CN");
-        gpui_component::init(cx);
+        gpui_kit::component::set_locale("zh-CN");
+        gpui_kit::init(cx);
 
         let gui_state_clone = gui_state.clone();
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                     None,
-                    size(px(1000.), px(700.)),
+                    size(px(1280.), px(720.)),
                     cx,
                 ))),
                 titlebar: Some(TitlebarOptions {

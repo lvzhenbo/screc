@@ -26,10 +26,7 @@ url = "2.5.8"
 rand = "0.10.2"
 regex = "1.13.1"
 clap = { version = "4.6.6", features = ["derive"] }
-gpui = { git = "https://github.com/zed-industries/zed" }
-gpui-component = { git = "https://github.com/longbridge/gpui-component" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform" }
-gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
+gpui-kit = "0.6.0"
 
 # 二进制大小优化配置
 [profile.release]
