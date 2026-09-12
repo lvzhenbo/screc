@@ -249,7 +249,7 @@ impl StripChatRecorder {
     ///
     /// 2026-08 起 StripChat 将 `/api/front/v2/models/username/{username}/cam` 端点
     /// 置于 Cloudflare 反机器人拦截（返回 HTTP 418），必须先通过
-    /// `/api/front/v2/users/username/{username}` 解析出用户ID，
+    /// `/api/front/users/user-ids/{username}` 解析出用户ID（响应为 `{"id":<user_id>}`），
     /// 再使用 `/api/front/v2/models/{user_id}/cam` 查询状态（响应结构一致）。
     ///
     /// 返回 `Ok(None)` 表示用户不存在（HTTP 404）。用户ID在用户名修改后保持稳定，
@@ -261,7 +261,7 @@ impl StripChatRecorder {
         }
 
         let url = format!(
-            "https://stripchat.com/api/front/v2/users/username/{}",
+            "https://stripchat.com/api/front/users/user-ids/{}",
             username
         );
         debug!("[{}] 解析用户ID: {}", username, url);
@@ -275,8 +275,10 @@ impl StripChatRecorder {
             status if !status.is_success() => Err(anyhow!("解析用户ID失败: HTTP {}", status)),
             _ => {
                 let json: serde_json::Value = response.json().await?;
-                let user_id = json["item"]["id"]
+                let user_id = json["id"]
                     .as_i64()
+                    .or_else(|| json["id"].as_str().and_then(|s| s.parse().ok()))
+                    .or_else(|| json["item"]["id"].as_i64())
                     .or_else(|| json["item"]["id"].as_str().and_then(|s| s.parse().ok()))
                     .ok_or_else(|| anyhow!("无法从响应中提取用户ID"))?;
                 self.user_id_cache.insert(username.to_string(), user_id);

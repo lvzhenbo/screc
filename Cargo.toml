@@ -18,7 +18,7 @@ chrono = { version = "0.4.45" }
 colored = "3.1.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-reqwest = { version = "0.13.4", features = ["json", "cookies", "socks"] }
+reqwest = { version = "0.13.5", features = ["json", "cookies", "socks"] }
 sha2 = "0.11.0"
 base64 = "0.23.1"
 m3u8-rs = "6.0.1"
@@ -26,7 +26,7 @@ url = "2.5.8"
 rand = "0.10.2"
 regex = "1.13.1"
 clap = { version = "4.6.6", features = ["derive"] }
-gpui-kit = "0.6.0"
+gpui-kit = "0.6.1"
 
 # 二进制大小优化配置
 [profile.release]
